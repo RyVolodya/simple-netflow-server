@@ -1,0 +1,74 @@
+name: simple-netflow-server
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: netflow
+      POSTGRES_USER: netflow
+      POSTGRES_PASSWORD: netflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [simple-netflow]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U netflow -d netflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  collector:
+    image: netsampler/goflow2:latest
+    restart: unless-stopped
+    # Run GoFlow2 as root so it can create /data/flows.jsonl directly in the named volume.
+    user: "0:0"
+    command:
+      - -listen=netflow://:2055,sflow://:6343
+      - -format=json
+      - -transport=file
+      - -transport.file=/data/flows.jsonl
+    ports:
+      - "2055:2055/udp"
+      - "6343:6343/udp"
+    volumes:
+      - flow_spool:/data
+    networks: [simple-netflow]
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://netflow:netflow@postgres:5432/netflow
+      FLOW_FILE: /data/flows.jsonl
+      RETENTION_DAYS: 30
+      RAW_RETENTION_HOURS: 12
+      STATS_RETENTION_HOURS: 720
+      APP_VERSION: 0.6.2
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-netflow}
+      SESSION_HOURS: ${SESSION_HOURS:-24}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - flow_spool:/data:ro
+    networks: [simple-netflow]
+
+  frontend:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+      - ./frontend/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on: [backend]
+    networks: [simple-netflow]
+
+networks:
+  simple-netflow:
+    name: simple-netflow
+
+volumes:
+  postgres_data:
+  flow_spool:
