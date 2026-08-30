@@ -118,13 +118,9 @@ Raw flow data uses daily PostgreSQL partitions to keep recent detailed traffic a
 
 ![Dashboard](docs/images/dashboard.png)
 
-### Flows — Detailed
+### Flows
 
-![Detailed Flows](docs/images/flows-detailed.png)
-
-### Flows — Summary
-
-![Flow Summary](docs/images/flows-summary.png)
+![Detailed Flows](docs/images/flows.png)
 
 ### Conversations
 
