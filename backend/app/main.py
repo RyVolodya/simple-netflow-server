@@ -6,11 +6,12 @@ import subprocess
 import ipaddress
 import hashlib
 import secrets
+import signal
 import time
 import socket
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import psycopg
@@ -22,14 +23,18 @@ from psycopg import sql
 
 DB = os.getenv("DATABASE_URL", "postgresql://netflow:netflow@postgres:5432/netflow")
 FLOW_FILE = os.getenv("FLOW_FILE", "/data/flows.jsonl")
+SPOOL_ROTATE_BYTES = max(16 * 1024 * 1024, int(os.getenv("SPOOL_ROTATE_BYTES", str(128 * 1024 * 1024))))
+COLLECTOR_PID = int(os.getenv("COLLECTOR_PID", "1"))
 DEFAULT_RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "30"))
-DEFAULT_RAW_RETENTION_HOURS = int(os.getenv("RAW_RETENTION_HOURS", "12"))
+DEFAULT_RAW_RETENTION_HOURS = int(os.getenv("RAW_RETENTION_HOURS", "24"))
 DEFAULT_STATS_RETENTION_HOURS = int(os.getenv("STATS_RETENTION_HOURS", "720"))
-VERSION = os.getenv("APP_VERSION", "0.6.2")
+VERSION = os.getenv("APP_VERSION", "0.7.7")
 DEFAULT_ADMIN_USER = os.getenv("ADMIN_USERNAME", "admin")
 DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "netflow")
 SESSION_HOURS = int(os.getenv("SESSION_HOURS", "24"))
 IDLE_SECONDS = 300
+ACTIVE_CACHE_FLUSH_SECONDS = max(1.0, float(os.getenv("ACTIVE_CACHE_FLUSH_SECONDS", "10")))
+ACTIVE_CACHE_MAX_RECORDS = max(500, int(os.getenv("ACTIVE_CACHE_MAX_RECORDS", "10000")))
 
 
 LIVE_SUBSCRIBERS: set[asyncio.Queue] = set()
@@ -109,6 +114,17 @@ CREATE TABLE IF NOT EXISTS app_settings (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS port_descriptions (
+  id BIGSERIAL PRIMARY KEY,
+  proto INTEGER NOT NULL CHECK(proto BETWEEN 0 AND 255),
+  port INTEGER NOT NULL CHECK(port BETWEEN 1 AND 65535),
+  description TEXT NOT NULL CHECK(length(btrim(description)) BETWEEN 1 AND 100),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(proto, port)
+);
+CREATE INDEX IF NOT EXISTS idx_port_descriptions_proto_port ON port_descriptions(proto, port);
+
 
 CREATE TABLE IF NOT EXISTS flow_agg_total_1m (
   bucket TIMESTAMPTZ PRIMARY KEY,
@@ -139,6 +155,57 @@ CREATE TABLE IF NOT EXISTS flow_agg_interface_1m (
   PRIMARY KEY(bucket, exporter, if_index)
 );
 CREATE INDEX IF NOT EXISTS idx_agg_interface_bucket ON flow_agg_interface_1m(bucket DESC);
+
+CREATE TABLE IF NOT EXISTS flow_conversations_5m (
+  id BIGSERIAL PRIMARY KEY,
+  bucket_start TIMESTAMPTZ NOT NULL,
+  conv_key TEXT NOT NULL,
+  first_seen TIMESTAMPTZ NOT NULL,
+  last_seen TIMESTAMPTZ NOT NULL,
+  received_at TIMESTAMPTZ NOT NULL,
+  flow_time TIMESTAMPTZ,
+  exporter INET,
+  flow_type TEXT,
+  src_addr INET,
+  dst_addr INET,
+  src_port INTEGER,
+  dst_port INTEGER,
+  proto INTEGER,
+  bytes BIGINT NOT NULL DEFAULT 0,
+  packets BIGINT NOT NULL DEFAULT 0,
+  flow_count BIGINT NOT NULL DEFAULT 0,
+  in_if INTEGER,
+  out_if INTEGER,
+  src_as BIGINT,
+  dst_as BIGINT,
+  src_country TEXT,
+  dst_country TEXT,
+  sampling_rate INTEGER,
+  tcp_flags INTEGER,
+  service_port INTEGER,
+  service_side TEXT,
+  UNIQUE(bucket_start, conv_key)
+);
+ALTER TABLE flow_conversations_5m ADD COLUMN IF NOT EXISTS service_port INTEGER;
+ALTER TABLE flow_conversations_5m ADD COLUMN IF NOT EXISTS service_side TEXT;
+-- v0.7.7: keep indexed columns immutable so conversation UPSERTs can use HOT updates.
+ALTER TABLE flow_conversations_5m SET (
+  fillfactor = 80,
+  autovacuum_vacuum_scale_factor = 0.02,
+  autovacuum_analyze_scale_factor = 0.05
+);
+DROP INDEX IF EXISTS idx_conv5m_last_seen;
+DROP INDEX IF EXISTS idx_conv5m_exporter;
+DROP INDEX IF EXISTS idx_conv5m_src;
+DROP INDEX IF EXISTS idx_conv5m_dst;
+DROP INDEX IF EXISTS idx_conv5m_proto;
+DROP INDEX IF EXISTS idx_conv5m_inif;
+DROP INDEX IF EXISTS idx_conv5m_outif;
+DROP INDEX IF EXISTS idx_conv5m_service;
+CREATE INDEX IF NOT EXISTS idx_conv5m_src_bucket ON flow_conversations_5m(src_addr, bucket_start DESC);
+CREATE INDEX IF NOT EXISTS idx_conv5m_dst_bucket ON flow_conversations_5m(dst_addr, bucket_start DESC);
+CREATE INDEX IF NOT EXISTS idx_conv5m_exporter_bucket_if ON flow_conversations_5m(exporter, bucket_start DESC, in_if, out_if);
+CREATE INDEX IF NOT EXISTS idx_conv5m_service_bucket ON flow_conversations_5m(proto, service_port, bucket_start DESC);
 
 CREATE TABLE IF NOT EXISTS users (
   id BIGSERIAL PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('administrator','user')),
@@ -241,7 +308,7 @@ def ensure_partitioned_flows():
                 cur.execute(f"CREATE INDEX {name} ON flows ({cols})")
             c.commit(); return
 
-        print('[v0.6.2] Migrating raw flows to daily partitions. This is a one-time operation...', flush=True)
+        print('[v0.7.7] Migrating raw flows to daily partitions. This is a one-time operation...', flush=True)
         cur.execute("SELECT count(*)::bigint n,min(received_at) mn,max(received_at) mx FROM flows")
         meta=cur.fetchone(); old_count=int(meta['n'])
         cur.execute("ALTER TABLE flows RENAME TO flows_legacy_052")
@@ -266,7 +333,7 @@ def ensure_partitioned_flows():
         for name,cols in OPTIMIZED_FLOW_INDEXES:
             cur.execute(f"CREATE INDEX {name} ON flows ({cols})")
         c.commit()
-        print(f'[v0.6.2] Partition migration complete: {new_count} flows preserved.', flush=True)
+        print(f'[v0.7.7] Partition migration complete: {new_count} flows preserved.', flush=True)
 
 
 def drop_expired_flow_partitions(cur, raw_hours):
@@ -288,18 +355,18 @@ def drop_expired_flow_partitions(cur, raw_hours):
 def storage_breakdown():
     agg_tables=['flow_agg_total_1m','flow_agg_src_1m','flow_agg_dst_1m','flow_agg_exporter_1m','flow_agg_app_1m','flow_agg_interface_1m']
     with conn() as c,c.cursor() as cur:
-        cur.execute("""SELECT coalesce(sum(pg_relation_size(c.oid)),0)::bigint raw_data,
-                              coalesce(sum(pg_indexes_size(c.oid)),0)::bigint raw_indexes,
-                              coalesce(sum(pg_total_relation_size(c.oid)),0)::bigint raw_total
-                       FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid
-                       JOIN pg_class p ON p.oid=i.inhparent WHERE p.relname='flows'""")
+        cur.execute("""SELECT pg_relation_size('flow_conversations_5m')::bigint raw_data,
+                              pg_indexes_size('flow_conversations_5m')::bigint raw_indexes,
+                              pg_total_relation_size('flow_conversations_5m')::bigint raw_total""")
         r=cur.fetchone()
-        cur.execute("SELECT coalesce(sum(pg_total_relation_size(to_regclass(x))),0)::bigint bytes FROM unnest(%s::text[]) x", (agg_tables,))
+        cur.execute('SELECT coalesce(sum(pg_total_relation_size(to_regclass(x))),0)::bigint bytes FROM unnest(%s::text[]) x',(agg_tables,))
         aggs=int(cur.fetchone()['bytes'] or 0)
-        cur.execute("SELECT pg_database_size(current_database())::bigint bytes")
-        total=int(cur.fetchone()['bytes'])
+        cur.execute('SELECT pg_database_size(current_database())::bigint bytes'); total=int(cur.fetchone()['bytes'])
+        cur.execute('SELECT count(*)::bigint rows,coalesce(sum(flow_count),0)::bigint flows FROM flow_conversations_5m'); meta=cur.fetchone()
         return {'raw_data_bytes':int(r['raw_data'] or 0),'raw_index_bytes':int(r['raw_indexes'] or 0),
-                'raw_total_bytes':int(r['raw_total'] or 0),'aggregates_bytes':aggs,'database_bytes':total}
+                'raw_total_bytes':int(r['raw_total'] or 0),'aggregates_bytes':aggs,'database_bytes':total,
+                'conversation_rows':int(meta['rows'] or 0),'aggregated_flows':int(meta['flows'] or 0)}
+
 
 COMMON_APPS = {
     (6, 20): "FTP Data", (6, 21): "FTP", (6, 22): "SSH", (6, 23): "Telnet",
@@ -309,7 +376,9 @@ COMMON_APPS = {
     (17, 500): "IKE", (6, 445): "SMB", (17, 514): "Syslog", (6, 993): "IMAPS",
     (6, 995): "POP3S", (17, 1194): "OpenVPN", (6, 1433): "MSSQL", (6, 3306): "MySQL",
     (6, 3389): "RDP", (6, 5432): "PostgreSQL", (6, 6379): "Redis", (6, 8000): "HTTP-alt",
-    (6, 8080): "HTTP-alt", (6, 8443): "HTTPS-alt", (17, 51820): "WireGuard"
+    (6, 8080): "HTTP-alt", (6, 8443): "HTTPS-alt", (6, 10050): "Zabbix Agent", (6, 10051): "Zabbix Server",
+    (17, 1812): "RADIUS", (17, 1813): "RADIUS Accounting", (17, 2055): "NetFlow", (17, 4739): "IPFIX",
+    (6, 5060): "SIP", (17, 5060): "SIP", (6, 33060): "MySQL X", (17, 51820): "WireGuard"
 }
 
 
@@ -465,7 +534,70 @@ def _bucket_minute(dt):
     return dt.replace(second=0, microsecond=0)
 
 
-def insert_flow_batch(rows):
+def _bucket_5m(dt):
+    minute=(dt.minute//5)*5
+    return dt.replace(minute=minute, second=0, microsecond=0)
+
+
+def _service_endpoint(r):
+    """Return (service_port, service_side, key_ports).
+
+    The service may be either the source or destination endpoint.  We first
+    prefer ports explicitly known by the application map, then well-known
+    ports, then a conservative registered-vs-ephemeral heuristic.  If both
+    ports are high/ambiguous, both remain in the key to avoid false merging.
+    """
+    sp=as_int(r.get('src_port')) or 0
+    dp=as_int(r.get('dst_port')) or 0
+    proto=parse_protocol(r.get('proto'))
+    if not sp and not dp:
+        return None, None, (None, None)
+    if sp and not dp:
+        return sp, 'source', (sp, None)
+    if dp and not sp:
+        return dp, 'destination', (None, dp)
+
+    src_known=(proto,sp) in COMMON_APPS
+    dst_known=(proto,dp) in COMMON_APPS
+    if src_known and not dst_known:
+        return sp, 'source', (sp, None)
+    if dst_known and not src_known:
+        return dp, 'destination', (None, dp)
+
+    # IANA well-known ports are a strong signal when only one side is in range.
+    if sp <= 1023 < dp:
+        return sp, 'source', (sp, None)
+    if dp <= 1023 < sp:
+        return dp, 'destination', (None, dp)
+
+    # Linux/BSD/Windows client ephemeral ranges commonly start around 32768 or
+    # above.  If exactly one side is below that boundary, use it as service.
+    if sp < 32768 <= dp:
+        return sp, 'source', (sp, None)
+    if dp < 32768 <= sp:
+        return dp, 'destination', (None, dp)
+
+    # Ambiguous custom/high-port traffic: keep exact ports in the key.
+    return None, None, (sp, dp)
+
+
+def _conversation_key(r):
+    service_port, service_side, key_ports = _service_endpoint(r)
+    # Direction remains explicit.  Ephemeral client ports are excluded when a
+    # service endpoint can be identified, but exporter and interface path stay
+    # in the key so WAN->LAN and LAN->WAN traffic never collapse together.
+    parts=(r.get('exporter'),r.get('src_addr'),r.get('dst_addr'),r.get('proto'),
+           service_port,service_side,key_ports[0],key_ports[1],r.get('in_if'),r.get('out_if'))
+    return hashlib.sha1('|'.join('' if v is None else str(v) for v in parts).encode()).hexdigest(), service_port, service_side
+
+
+def insert_flow_batch(rows, offset_key=None, end_offset=None):
+    """Aggregate incoming NetFlow records into 5-minute conversations.
+
+    Individual raw records are NOT inserted into PostgreSQL. Records are first
+    collapsed in an in-memory micro-batch cache, then service-oriented rows and
+    the durable spool offset are committed in one PostgreSQL transaction.
+    """
     if not rows:
         return 0
     total = defaultdict(lambda: [0,0,0])
@@ -474,48 +606,87 @@ def insert_flow_batch(rows):
     exp = defaultdict(lambda: [0,0,0])
     appagg = defaultdict(lambda: [0,0,0])
     iface = defaultdict(lambda: [0,0,0])
-    exporters_seen = set()
+    conversations={}
+    exporters_seen=set()
+
     for r in rows:
-        b=_bucket_minute(r["received_at"]); vals=(r["bytes"],r["packets"],1)
-        for store,key in [(total,b)]:
-            a=store[key]; a[0]+=vals[0]; a[1]+=vals[1]; a[2]+=1
-        if r["src_addr"]:
-            a=src[(b,r["src_addr"])]; a[0]+=vals[0]; a[1]+=vals[1]; a[2]+=1
-        if r["dst_addr"]:
-            a=dst[(b,r["dst_addr"])]; a[0]+=vals[0]; a[1]+=vals[1]; a[2]+=1
-        if r["exporter"]:
-            exporters_seen.add(r["exporter"]); a=exp[(b,r["exporter"])]; a[0]+=vals[0]; a[1]+=vals[1]; a[2]+=1
-            for idx in {r.get("in_if"), r.get("out_if")} - {None}:
-                a=iface[(b,r["exporter"],idx)]; a[0]+=vals[0]; a[1]+=vals[1]; a[2]+=1
-        proto=r.get("proto")
-        port=r.get("dst_port") if (r.get("dst_port") or 0) in range(1,49152) else r.get("src_port")
+        b1=_bucket_minute(r['received_at']); vals=(r['bytes'],r['packets'],1)
+        a=total[b1]; a[0]+=vals[0]; a[1]+=vals[1]; a[2]+=1
+        if r['src_addr']:
+            a=src[(b1,r['src_addr'])]; a[0]+=vals[0]; a[1]+=vals[1]; a[2]+=1
+        if r['dst_addr']:
+            a=dst[(b1,r['dst_addr'])]; a[0]+=vals[0]; a[1]+=vals[1]; a[2]+=1
+        if r['exporter']:
+            exporters_seen.add(r['exporter']); a=exp[(b1,r['exporter'])]; a[0]+=vals[0]; a[1]+=vals[1]; a[2]+=1
+            for idx in {r.get('in_if'),r.get('out_if')} - {None}:
+                a=iface[(b1,r['exporter'],idx)]; a[0]+=vals[0]; a[1]+=vals[1]; a[2]+=1
+        proto=r.get('proto')
+        service_port, service_side, _ = _service_endpoint(r)
+        port=service_port
         if proto is not None and port is not None:
-            a=appagg[(b,proto,int(port))]; a[0]+=vals[0]; a[1]+=vals[1]; a[2]+=1
-    copy_cols = ("received_at","flow_time","exporter","flow_type","src_addr","dst_addr","src_port","dst_port","proto","bytes","packets","in_if","out_if","src_as","dst_as","src_country","dst_country","sampling_rate","tcp_flags")
-    with psycopg.connect(DB, row_factory=dict_row) as c, c.cursor() as cur:
-        with cur.copy("COPY flows(received_at,flow_time,exporter,flow_type,src_addr,dst_addr,src_port,dst_port,proto,bytes,packets,in_if,out_if,src_as,dst_as,src_country,dst_country,sampling_rate,tcp_flags) FROM STDIN") as cp:
-            for r in rows:
-                cp.write_row(tuple(r.get(k) for k in copy_cols))
+            a=appagg[(b1,proto,int(port))]; a[0]+=vals[0]; a[1]+=vals[1]; a[2]+=1
+
+        b5=_bucket_5m(r['received_at']); conv_key, service_port, service_side = _conversation_key(r); key=(b5,conv_key)
+        c=conversations.get(key)
+        if c is None:
+            c=dict(r)
+            c.update(bucket_start=b5,conv_key=key[1],first_seen=r['received_at'],last_seen=r['received_at'],flow_count=1,service_port=service_port,service_side=service_side)
+            # Do not expose a stale client ephemeral port after multiple flows
+            # have been merged into this service conversation.
+            if service_side == 'source': c['dst_port']=None
+            elif service_side == 'destination': c['src_port']=None
+            conversations[key]=c
+        else:
+            c['bytes']+=r['bytes']; c['packets']+=r['packets']; c['flow_count']+=1
+            c['first_seen']=min(c['first_seen'],r['received_at']); c['last_seen']=max(c['last_seen'],r['received_at'])
+            c['received_at']=c['last_seen']
+            if r.get('flow_time') and (not c.get('flow_time') or r['flow_time']>c['flow_time']): c['flow_time']=r['flow_time']
+            # Keep recent metadata without increasing key cardinality.
+            for k in ('src_as','dst_as','src_country','dst_country','sampling_rate','tcp_flags','flow_type'):
+                if r.get(k) is not None: c[k]=r.get(k)
+
+    with psycopg.connect(DB, row_factory=dict_row) as db, db.cursor() as cur:
+        conv_cols=('bucket_start','conv_key','first_seen','last_seen','received_at','flow_time','exporter','flow_type','src_addr','dst_addr','src_port','dst_port','proto','bytes','packets','flow_count','in_if','out_if','src_as','dst_as','src_country','dst_country','sampling_rate','tcp_flags','service_port','service_side')
+        vals=[tuple(c.get(k) for k in conv_cols) for c in conversations.values()]
+        ph=','.join(['%s']*len(conv_cols))
+        cur.executemany(f"""INSERT INTO flow_conversations_5m({','.join(conv_cols)}) VALUES({ph})
+            ON CONFLICT(bucket_start,conv_key) DO UPDATE SET
+              first_seen=LEAST(flow_conversations_5m.first_seen,excluded.first_seen),
+              last_seen=GREATEST(flow_conversations_5m.last_seen,excluded.last_seen),
+              received_at=GREATEST(flow_conversations_5m.received_at,excluded.received_at),
+              flow_time=GREATEST(flow_conversations_5m.flow_time,excluded.flow_time),
+              bytes=flow_conversations_5m.bytes+excluded.bytes,
+              packets=flow_conversations_5m.packets+excluded.packets,
+              flow_count=flow_conversations_5m.flow_count+excluded.flow_count,
+              src_as=COALESCE(excluded.src_as,flow_conversations_5m.src_as),
+              dst_as=COALESCE(excluded.dst_as,flow_conversations_5m.dst_as),
+              src_country=COALESCE(excluded.src_country,flow_conversations_5m.src_country),
+              dst_country=COALESCE(excluded.dst_country,flow_conversations_5m.dst_country),
+              sampling_rate=COALESCE(excluded.sampling_rate,flow_conversations_5m.sampling_rate),
+              tcp_flags=COALESCE(excluded.tcp_flags,flow_conversations_5m.tcp_flags),
+              flow_type=COALESCE(excluded.flow_type,flow_conversations_5m.flow_type)""", vals)
         if exporters_seen:
             cur.executemany("""INSERT INTO exporters(ip,first_seen,last_seen) VALUES(%s::inet,now(),now())
-                               ON CONFLICT(ip) DO UPDATE SET last_seen=excluded.last_seen""", [(x,) for x in exporters_seen])
+                               ON CONFLICT(ip) DO UPDATE SET last_seen=excluded.last_seen""",[(x,) for x in exporters_seen])
         def upsert(table, cols, data):
             if not data: return
-            keys=list(data.keys())
             vals=[]
-            for k in keys:
+            for k,v in data.items():
                 kt=k if isinstance(k,tuple) else (k,)
-                v=data[k]; vals.append((*kt,*v))
-            keycols=','.join(cols); placeholders=','.join(['%s']*(len(cols)+3))
-            conflict=','.join(cols)
-            cur.executemany(f"INSERT INTO {table}({keycols},bytes,packets,flows) VALUES({placeholders}) ON CONFLICT({conflict}) DO UPDATE SET bytes={table}.bytes+excluded.bytes, packets={table}.packets+excluded.packets, flows={table}.flows+excluded.flows", vals)
+                vals.append((*kt,*v))
+            keycols=','.join(cols); placeholders=','.join(['%s']*(len(cols)+3)); conflict=','.join(cols)
+            cur.executemany(f"INSERT INTO {table}({keycols},bytes,packets,flows) VALUES({placeholders}) ON CONFLICT({conflict}) DO UPDATE SET bytes={table}.bytes+excluded.bytes, packets={table}.packets+excluded.packets, flows={table}.flows+excluded.flows",vals)
         upsert('flow_agg_total_1m',['bucket'],total)
         upsert('flow_agg_src_1m',['bucket','src_addr'],src)
         upsert('flow_agg_dst_1m',['bucket','dst_addr'],dst)
         upsert('flow_agg_exporter_1m',['bucket','exporter'],exp)
         upsert('flow_agg_app_1m',['bucket','proto','port'],appagg)
         upsert('flow_agg_interface_1m',['bucket','exporter','if_index'],iface)
-        c.commit()
+        if offset_key is not None and end_offset is not None:
+            cur.execute("""INSERT INTO app_settings(key,value) VALUES(%s,%s)
+                           ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=now()""",
+                        (str(offset_key), str(int(end_offset))))
+        db.commit()
     return len(rows)
 
 
@@ -535,10 +706,153 @@ def set_setting(key, value):
         )
 
 
+def _spool_rotation_state():
+    return (
+        str(get_setting("flow_spool_rotation_file", "") or ""),
+        max(0, int(get_setting("flow_spool_rotation_offset", 0) or 0)),
+    )
+
+
+def _clear_spool_rotation_state():
+    set_setting("flow_spool_rotation_file", "")
+    set_setting("flow_spool_rotation_offset", 0)
+
+
+def _ingest_file_tail(path, start_pos, offset_key="flow_spool_rotation_offset"):
+    """Ingest a stable JSONL tail and atomically persist its committed offset."""
+    pos=max(0,int(start_pos))
+    batch=[]
+    batch_end=pos
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        f.seek(pos)
+        while True:
+            line=f.readline()
+            if not line:
+                break
+            line_end=f.tell()
+            try:
+                batch.append(normalize_flow(json.loads(line)))
+                batch_end=line_end
+            except Exception:
+                # Flush valid records before consuming a malformed line so the
+                # offset never jumps over uncommitted data.
+                if batch:
+                    insert_flow_batch(batch, offset_key, batch_end)
+                    batch=[]
+                set_setting(offset_key, int(line_end))
+                pos=line_end
+                continue
+            if len(batch)>=ACTIVE_CACHE_MAX_RECORDS:
+                insert_flow_batch(batch, offset_key, batch_end)
+                batch=[]
+                pos=batch_end
+        if batch:
+            insert_flow_batch(batch, offset_key, batch_end)
+            pos=batch_end
+        else:
+            pos=max(pos, f.tell())
+    return pos
+
+
+async def _recover_rotated_spool():
+    """Finish an interrupted spool rotation without re-importing already committed records."""
+    rotated, offset = await asyncio.to_thread(_spool_rotation_state)
+    if not rotated:
+        return
+    try:
+        if os.path.exists(rotated):
+            # The collector receives SIGHUP during rotation. Give any final O_APPEND write time to land.
+            last=-1
+            stable=0
+            while stable < 3:
+                size=os.path.getsize(rotated)
+                stable = stable + 1 if size == last else 0
+                last=size
+                await asyncio.sleep(0.05)
+            final_pos=await asyncio.to_thread(_ingest_file_tail, rotated, offset, "flow_spool_rotation_offset")
+            os.unlink(rotated)
+        await asyncio.to_thread(_clear_spool_rotation_state)
+        await asyncio.to_thread(set_setting, "flow_spool_offset", 0)
+        print(f"[v0.7.7] recovered spool rotation: {rotated}", flush=True)
+    except Exception as e:
+        print(f"[v0.7.7] spool rotation recovery error: {e}", flush=True)
+        raise
+
+
+async def _rotate_consumed_spool(path, pos):
+    """
+    Crash-safe spool compaction:
+      1) only rotate when backend has committed through EOF;
+      2) rename the active file (same inode remains open in GoFlow2);
+      3) SIGHUP GoFlow2 so it closes the renamed file and opens a new flows.jsonl;
+      4) ingest the tiny race-window tail from the rotated file;
+      5) delete the rotated file only after PostgreSQL commit.
+    """
+    if pos < SPOOL_ROTATE_BYTES or not os.path.exists(path):
+        return pos, False
+    size=os.path.getsize(path)
+    if size != pos:
+        return pos, False
+
+    rotated=f"{path}.rotated"
+    if os.path.exists(rotated):
+        # A previous interrupted rotation will be recovered before another rotation starts.
+        return pos, False
+
+    # Persist recovery metadata BEFORE changing the filesystem.
+    await asyncio.to_thread(set_setting, "flow_spool_rotation_file", rotated)
+    await asyncio.to_thread(set_setting, "flow_spool_rotation_offset", int(pos))
+    os.replace(path, rotated)
+
+    try:
+        os.kill(COLLECTOR_PID, signal.SIGHUP)
+    except Exception as e:
+        # Restore the original path if the collector cannot be told to reopen it.
+        try:
+            if not os.path.exists(path) and os.path.exists(rotated):
+                os.replace(rotated, path)
+        finally:
+            await asyncio.to_thread(_clear_spool_rotation_state)
+        raise RuntimeError(f"cannot signal collector PID {COLLECTOR_PID}: {e}")
+
+    # Wait until the collector has closed the renamed O_APPEND file.
+    last=-1
+    stable=0
+    while stable < 3:
+        size_now=os.path.getsize(rotated) if os.path.exists(rotated) else 0
+        stable = stable + 1 if size_now == last else 0
+        last=size_now
+        await asyncio.sleep(0.05)
+
+    # Consume only bytes appended after the already-committed offset.
+    final_pos=await asyncio.to_thread(_ingest_file_tail, rotated, pos, "flow_spool_rotation_offset")
+    if os.path.exists(rotated):
+        os.unlink(rotated)
+    await asyncio.to_thread(_clear_spool_rotation_state)
+    await asyncio.to_thread(set_setting, "flow_spool_offset", 0)
+    print(f"[v0.7.7] spool rotated and compacted: freed {final_pos} bytes", flush=True)
+    return 0, True
+
+
 async def spool_ingester():
     path = FLOW_FILE
+
+    # Recover first if the backend/container was interrupted in the middle of a prior rotation.
+    try:
+        await _recover_rotated_spool()
+    except Exception:
+        # Keep retrying recovery; do not start normal ingestion while a rotated file is unresolved.
+        while True:
+            await asyncio.sleep(2)
+            try:
+                await _recover_rotated_spool()
+                break
+            except Exception:
+                pass
+
     while not os.path.exists(path):
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.2)
+
     try:
         pos = max(0, int(get_setting("flow_spool_offset", 0)))
     except Exception:
@@ -549,17 +863,21 @@ async def spool_ingester():
     async def flush_batch(end_pos):
         nonlocal batch, last_flush, pos
         if batch:
-            flushed=batch; batch=[]
-            n=await asyncio.to_thread(insert_flow_batch,flushed)
+            flushed=batch
+            batch=[]
+            n=await asyncio.to_thread(insert_flow_batch,flushed,'flow_spool_offset',int(end_pos))
             if n:
                 publish_live_event({"type":"flow","count":n,"ts":datetime.now(timezone.utc).isoformat()})
-        # Persist the byte offset only after the batch has been committed.
-        await asyncio.to_thread(set_setting, "flow_spool_offset", int(end_pos))
+        else:
+            await asyncio.to_thread(set_setting, "flow_spool_offset", int(end_pos))
         pos=int(end_pos)
         last_flush=asyncio.get_running_loop().time()
 
     while True:
         try:
+            if not os.path.exists(path):
+                await asyncio.sleep(0.05)
+                continue
             size=os.path.getsize(path)
             if size < pos:
                 pos=0
@@ -567,43 +885,58 @@ async def spool_ingester():
             with open(path,'r',encoding='utf-8',errors='ignore') as f:
                 f.seek(pos)
                 while True:
+                    line_start=f.tell()
                     line=f.readline()
-                    if not line: break
+                    if not line:
+                        break
                     line_end=f.tell()
                     try:
                         batch.append(normalize_flow(json.loads(line)))
                     except Exception:
-                        # Malformed lines are considered consumed so a restart does not loop forever.
+                        # Commit preceding valid records before consuming the bad line.
+                        if batch:
+                            await flush_batch(line_start)
                         await asyncio.to_thread(set_setting, "flow_spool_offset", int(line_end))
                         pos=line_end
                         continue
                     now=asyncio.get_running_loop().time()
-                    if len(batch)>=500 or now-last_flush>=0.5:
+                    if len(batch)>=ACTIVE_CACHE_MAX_RECORDS or now-last_flush>=ACTIVE_CACHE_FLUSH_SECONDS:
                         await flush_batch(line_end)
-                # Commit any tail batch at EOF. This keeps the persisted offset and DB contents
-                # in sync and prevents re-reading uncommitted lines on the next loop.
                 if batch:
                     await flush_batch(f.tell())
-        except Exception:
-            pass
-        await asyncio.sleep(0.2)
+
+            # Keep the active spool bounded under normal operation.
+            pos, rotated = await _rotate_consumed_spool(path, pos)
+            if rotated:
+                batch=[]
+                last_flush=asyncio.get_running_loop().time()
+        except Exception as e:
+            print(f"[v0.7.7] spool ingest error: {e}", flush=True)
+        # Read/commit in short micro-batches instead of touching PostgreSQL for
+        # every burst. Five seconds keeps the UI near-real-time while greatly
+        # reducing UPSERT/WAL churn.
+        await asyncio.sleep(ACTIVE_CACHE_FLUSH_SECONDS)
 
 
 async def retention_worker():
     while True:
         try:
-            old=int(get_setting('retention_hours', int(get_setting('retention_days', DEFAULT_RETENTION_DAYS))*24))
-            raw_hours=max(1,int(get_setting('raw_retention_hours', DEFAULT_RAW_RETENTION_HOURS)))
+            detailed_hours=max(1,int(get_setting('raw_retention_hours', DEFAULT_RAW_RETENTION_HOURS)))
             stats_hours=max(6,int(get_setting('stats_retention_hours', DEFAULT_STATS_RETENTION_HOURS)))
-            await asyncio.to_thread(ensure_future_flow_partitions, 2)
-            with conn() as c, c.cursor() as cur:
-                drop_expired_flow_partitions(cur, raw_hours)
+            with conn() as c,c.cursor() as cur:
+                cur.execute("DELETE FROM flow_conversations_5m WHERE last_seen < now() - (%s || ' hours')::interval",(detailed_hours,))
+                # v0.7 no longer writes legacy raw rows. If upgrading in place,
+                # let the old raw partitions age out automatically.
+                cur.execute("SELECT to_regclass('public.flows') AS reg")
+                if cur.fetchone()['reg'] is not None:
+                    try: drop_expired_flow_partitions(cur,detailed_hours)
+                    except Exception as e: print(f'[v0.7.7] legacy raw cleanup warning: {e}',flush=True)
                 for table in ['flow_agg_total_1m','flow_agg_src_1m','flow_agg_dst_1m','flow_agg_exporter_1m','flow_agg_app_1m','flow_agg_interface_1m']:
-                    cur.execute(f"DELETE FROM {table} WHERE bucket < now() - (%s || ' hours')::interval", (stats_hours,))
-                cur.execute("DELETE FROM sessions WHERE expires_at < now()")
+                    cur.execute(f"DELETE FROM {table} WHERE bucket < now() - (%s || ' hours')::interval",(stats_hours,))
+                cur.execute('DELETE FROM sessions WHERE expires_at < now()')
                 SUMMARY_CACHE['data']=None
         except Exception as e:
-            print(f'[v0.6.2] retention error: {e}', flush=True)
+            print(f'[v0.7.7] retention error: {e}',flush=True)
         await asyncio.sleep(3600)
 
 
@@ -636,41 +969,40 @@ def authenticate_session(token):
 
 
 def rebuild_aggregates(force=False):
-    with psycopg.connect(DB, row_factory=dict_row) as c, c.cursor() as cur:
-        cur.execute("SELECT EXISTS(SELECT 1 FROM flow_agg_total_1m) has")
+    with psycopg.connect(DB,row_factory=dict_row) as c,c.cursor() as cur:
+        cur.execute('SELECT EXISTS(SELECT 1 FROM flow_agg_total_1m) has')
         if cur.fetchone()['has'] and not force: return
         if force:
-            cur.execute("TRUNCATE flow_agg_total_1m,flow_agg_src_1m,flow_agg_dst_1m,flow_agg_exporter_1m,flow_agg_app_1m,flow_agg_interface_1m")
-        print('[v0.6.2] Building 1-minute dashboard aggregates from existing flows...', flush=True)
-        cur.execute("SELECT EXISTS(SELECT 1 FROM flows) has")
-        if not cur.fetchone()['has']: return
+            cur.execute('TRUNCATE flow_agg_total_1m,flow_agg_src_1m,flow_agg_dst_1m,flow_agg_exporter_1m,flow_agg_app_1m,flow_agg_interface_1m')
+        cur.execute('SELECT EXISTS(SELECT 1 FROM flow_conversations_5m) has')
+        if not cur.fetchone()['has']: c.commit(); return
+        print('[v0.7.7] rebuilding dashboard aggregates from 5-minute conversations...',flush=True)
         cur.execute("""INSERT INTO flow_agg_total_1m(bucket,bytes,packets,flows)
-                       SELECT date_trunc('minute',received_at),sum(bytes),sum(packets),count(*) FROM flows GROUP BY 1""")
+          SELECT date_trunc('minute',last_seen),sum(bytes),sum(packets),sum(flow_count) FROM flow_conversations_5m GROUP BY 1""")
         cur.execute("""INSERT INTO flow_agg_src_1m(bucket,src_addr,bytes,packets,flows)
-                       SELECT date_trunc('minute',received_at),src_addr,sum(bytes),sum(packets),count(*) FROM flows WHERE src_addr IS NOT NULL GROUP BY 1,2""")
+          SELECT date_trunc('minute',last_seen),src_addr,sum(bytes),sum(packets),sum(flow_count) FROM flow_conversations_5m WHERE src_addr IS NOT NULL GROUP BY 1,2""")
         cur.execute("""INSERT INTO flow_agg_dst_1m(bucket,dst_addr,bytes,packets,flows)
-                       SELECT date_trunc('minute',received_at),dst_addr,sum(bytes),sum(packets),count(*) FROM flows WHERE dst_addr IS NOT NULL GROUP BY 1,2""")
+          SELECT date_trunc('minute',last_seen),dst_addr,sum(bytes),sum(packets),sum(flow_count) FROM flow_conversations_5m WHERE dst_addr IS NOT NULL GROUP BY 1,2""")
         cur.execute("""INSERT INTO flow_agg_exporter_1m(bucket,exporter,bytes,packets,flows)
-                       SELECT date_trunc('minute',received_at),exporter,sum(bytes),sum(packets),count(*) FROM flows WHERE exporter IS NOT NULL GROUP BY 1,2""")
+          SELECT date_trunc('minute',last_seen),exporter,sum(bytes),sum(packets),sum(flow_count) FROM flow_conversations_5m WHERE exporter IS NOT NULL GROUP BY 1,2""")
         cur.execute("""INSERT INTO flow_agg_app_1m(bucket,proto,port,bytes,packets,flows)
-                       SELECT date_trunc('minute',received_at),proto,CASE WHEN dst_port BETWEEN 1 AND 49151 THEN dst_port WHEN src_port BETWEEN 1 AND 49151 THEN src_port ELSE dst_port END,
-                              sum(bytes),sum(packets),count(*) FROM flows
-                       WHERE proto IS NOT NULL AND (CASE WHEN dst_port BETWEEN 1 AND 49151 THEN dst_port WHEN src_port BETWEEN 1 AND 49151 THEN src_port ELSE dst_port END) IS NOT NULL GROUP BY 1,2,3""")
+          SELECT date_trunc('minute',last_seen),proto,COALESCE(service_port,dst_port,src_port),sum(bytes),sum(packets),sum(flow_count)
+          FROM flow_conversations_5m WHERE proto IS NOT NULL AND COALESCE(service_port,dst_port,src_port) IS NOT NULL GROUP BY 1,2,3""")
         cur.execute("""INSERT INTO flow_agg_interface_1m(bucket,exporter,if_index,bytes,packets,flows)
-                       SELECT bucket,exporter,if_index,sum(bytes),sum(packets),sum(flows) FROM (
-                         SELECT date_trunc('minute',received_at) bucket,exporter,in_if if_index,sum(bytes) bytes,sum(packets) packets,count(*) flows FROM flows WHERE exporter IS NOT NULL AND in_if IS NOT NULL GROUP BY 1,2,3
-                         UNION ALL
-                         SELECT date_trunc('minute',received_at),exporter,out_if,sum(bytes),sum(packets),count(*) FROM flows WHERE exporter IS NOT NULL AND out_if IS NOT NULL GROUP BY 1,2,3
-                       ) x GROUP BY 1,2,3""")
+          SELECT bucket,exporter,if_index,sum(bytes),sum(packets),sum(flows) FROM (
+            SELECT date_trunc('minute',last_seen) bucket,exporter,in_if if_index,sum(bytes) bytes,sum(packets) packets,sum(flow_count) flows FROM flow_conversations_5m WHERE exporter IS NOT NULL AND in_if IS NOT NULL GROUP BY 1,2,3
+            UNION ALL
+            SELECT date_trunc('minute',last_seen),exporter,out_if,sum(bytes),sum(packets),sum(flow_count) FROM flow_conversations_5m WHERE exporter IS NOT NULL AND out_if IS NOT NULL GROUP BY 1,2,3
+          ) x GROUP BY 1,2,3""")
         c.commit()
-        print('[v0.6.2] Dashboard aggregates ready.', flush=True)
+
 
 def bootstrap_metadata():
     with conn() as c, c.cursor() as cur:
         cur.execute(
             """INSERT INTO exporters(ip, first_seen, last_seen)
-               SELECT exporter, min(received_at), max(received_at)
-               FROM flows WHERE exporter IS NOT NULL GROUP BY exporter
+               SELECT exporter, min(first_seen), max(last_seen)
+               FROM flow_conversations_5m WHERE exporter IS NOT NULL GROUP BY exporter
                ON CONFLICT(ip) DO UPDATE SET
                  first_seen=LEAST(exporters.first_seen, excluded.first_seen),
                  last_seen=GREATEST(exporters.last_seen, excluded.last_seen)"""
@@ -684,7 +1016,7 @@ def bootstrap_metadata():
         existing_days=int(retention_days_row['value']) if retention_days_row else DEFAULT_RETENTION_DAYS
         cur.execute("INSERT INTO app_settings(key,value) VALUES('retention_hours',%s) ON CONFLICT(key) DO NOTHING", (str(existing_days * 24),))
         cur.execute("SELECT value FROM app_settings WHERE key='retention_hours'"); rh=cur.fetchone(); existing_hours=int(rh['value']) if rh else existing_days*24
-        # v0.6.2 defaults for fresh installations. Existing installations keep
+        # v0.6.3 defaults for fresh installations. Existing installations keep
         # their saved values because ON CONFLICT does not overwrite them.
         cur.execute("INSERT INTO app_settings(key,value) VALUES('raw_retention_hours',%s) ON CONFLICT(key) DO NOTHING", (str(DEFAULT_RAW_RETENTION_HOURS),))
         cur.execute("INSERT INTO app_settings(key,value) VALUES('stats_retention_hours',%s) ON CONFLICT(key) DO NOTHING", (str(DEFAULT_STATS_RETENTION_HOURS),))
@@ -699,7 +1031,6 @@ async def lifespan(app: FastAPI):
     last_error=None
     for attempt in range(30):
         try:
-            await asyncio.to_thread(ensure_partitioned_flows)
             with conn() as c:
                 c.execute(SCHEMA)
             bootstrap_metadata()
@@ -708,10 +1039,10 @@ async def lifespan(app: FastAPI):
             break
         except Exception as e:
             last_error=e
-            print(f'[v0.6.2] startup attempt {attempt+1}/30 failed: {e}', flush=True)
+            print(f'[v0.7.7] startup attempt {attempt+1}/30 failed: {e}', flush=True)
             await asyncio.sleep(1)
     if not initialized:
-        raise RuntimeError(f'v0.6.2 storage initialization failed: {last_error}')
+        raise RuntimeError(f'v0.7.7 storage initialization failed: {last_error}')
     t1 = asyncio.create_task(spool_ingester())
     t2 = asyncio.create_task(retention_worker())
     yield
@@ -746,6 +1077,22 @@ async def auth_middleware(request: Request, call_next):
 class LoginRequest(BaseModel):
     username: str
     password: str
+
+
+class PortDescriptionItem(BaseModel):
+    protocol: int | str
+    port: int = Field(ge=1, le=65535)
+    description: str = Field(min_length=1, max_length=100)
+
+
+class PortDescriptionBulkRequest(BaseModel):
+    items: list[PortDescriptionItem]
+
+
+class PortDescriptionUpdateRequest(BaseModel):
+    protocol: int | str
+    port: int = Field(ge=1, le=65535)
+    description: str = Field(min_length=1, max_length=100)
 
 class ExporterDeleteRequest(BaseModel):
     exporter: str
@@ -965,10 +1312,13 @@ def top(kind: str = Query("src", pattern="^(src|dst|port|exporter|proto|app)$"),
     table_map={'src':('flow_agg_src_1m','host(src_addr)'),'dst':('flow_agg_dst_1m','host(dst_addr)')}
     with conn() as c, c.cursor() as cur:
         if kind=='app':
-            cur.execute("""SELECT proto,port,sum(bytes)::bigint bytes,sum(flows)::bigint flows FROM flow_agg_app_1m
-                           WHERE bucket>=now()-(%s || ' hours')::interval GROUP BY proto,port ORDER BY bytes DESC LIMIT %s""",(h,limit))
+            cur.execute("""SELECT a.proto,a.port,sum(a.bytes)::bigint bytes,sum(a.flows)::bigint flows,p.description
+                           FROM flow_agg_app_1m a LEFT JOIN port_descriptions p ON p.proto=a.proto AND p.port=a.port
+                           WHERE a.bucket>=now()-(%s || ' hours')::interval
+                           GROUP BY a.proto,a.port,p.description ORDER BY bytes DESC LIMIT %s""",(h,limit))
             rows=cur.fetchall()
-            for r in rows:r['label']=app_name(r['proto'],r['port'])
+            for r in rows:
+                r['label']=(f"{r['description']} {protocol_name(r['proto'])}/{r['port']}" if r.get('description') else app_name(r['proto'],r['port']))
             return rows
         if kind=='exporter':
             cur.execute("""SELECT host(a.exporter) exporter,
@@ -996,9 +1346,12 @@ def top_interfaces(hours: int = 1, limit: int = 10):
     with conn() as c,c.cursor() as cur:
         cur.execute("""WITH s AS (SELECT exporter,if_index,sum(bytes)::bigint bytes,sum(flows)::bigint flows FROM flow_agg_interface_1m
                                   WHERE bucket>=now()-(%s || ' hours')::interval GROUP BY exporter,if_index)
-                       SELECT host(s.exporter) exporter,s.if_index,coalesce(nullif(i.if_name,''),nullif(i.if_descr,''),'ifIndex '||s.if_index::text) interface_name,
+                       SELECT host(s.exporter) exporter,s.if_index,
+                              CASE WHEN nullif(i.if_alias,'') IS NOT NULL THEN coalesce(nullif(i.if_name,''),nullif(i.if_descr,''),'ifIndex '||s.if_index::text)||' ('||i.if_alias||')'
+                                   ELSE coalesce(nullif(i.if_name,''),nullif(i.if_descr,''),'ifIndex '||s.if_index::text) END interface_name,
                               coalesce(nullif(e.hostname,''),host(s.exporter)) device_name,
-                              coalesce(nullif(i.if_name,''),nullif(i.if_descr,''),'ifIndex '||s.if_index::text)||' ('||coalesce(nullif(e.hostname,''),host(s.exporter))||')' label,
+                              (CASE WHEN nullif(i.if_alias,'') IS NOT NULL THEN coalesce(nullif(i.if_name,''),nullif(i.if_descr,''),'ifIndex '||s.if_index::text)||' ('||i.if_alias||')'
+                                    ELSE coalesce(nullif(i.if_name,''),nullif(i.if_descr,''),'ifIndex '||s.if_index::text) END)||' ('||coalesce(nullif(e.hostname,''),host(s.exporter))||')' label,
                               s.bytes,s.flows FROM s LEFT JOIN interfaces i ON i.exporter=s.exporter AND i.if_index=s.if_index
                               LEFT JOIN exporters e ON e.ip=s.exporter ORDER BY s.bytes DESC LIMIT %s""",(h,limit))
         return cur.fetchall()
@@ -1010,12 +1363,12 @@ def device_timeseries(hours: int = 24, limit: int = 10):
     with conn() as c, c.cursor() as cur:
         cur.execute(
             """WITH top_devices AS (
-                 SELECT exporter, sum(bytes) b FROM flows
+                 SELECT exporter, sum(bytes) b FROM flow_conversations_5m
                  WHERE received_at >= now() - (%s || ' hours')::interval AND exporter IS NOT NULL
                  GROUP BY exporter ORDER BY b DESC LIMIT %s
                )
                SELECT date_trunc('hour', f.received_at) bucket, host(f.exporter) exporter, sum(f.bytes)::bigint bytes
-               FROM flows f JOIN top_devices t ON t.exporter=f.exporter
+               FROM flow_conversations_5m f JOIN top_devices t ON t.exporter=f.exporter
                WHERE f.received_at >= now() - (%s || ' hours')::interval
                GROUP BY 1,2 ORDER BY 1,2""",
             (hours, limit, hours),
@@ -1050,20 +1403,29 @@ def build_flow_filter(
     interface_index: Optional[int] = None,
 ):
     clauses, params = [], []
+    # v0.7.7: use immutable bucket_start as the indexable time predicate, then
+    # keep received_at/last update as an exact boundary check. This avoids an
+    # index on a column that changes on every conversation UPSERT.
     if date_from:
+        clauses.append("f.bucket_start >= %s - interval '5 minutes'")
+        params.append(date_from)
         clauses.append("f.received_at >= %s")
         params.append(date_from)
     if date_to:
+        clauses.append("f.bucket_start <= %s")
+        params.append(date_to)
         clauses.append("f.received_at <= %s")
         params.append(date_to)
     if not date_from and not date_to and hours is not None:
         h = min(max(hours, 1), 24 * 365)
+        clauses.append("f.bucket_start >= now() - (%s || ' hours')::interval - interval '5 minutes'")
+        params.append(h)
         clauses.append("f.received_at >= now() - (%s || ' hours')::interval")
         params.append(h)
     if q:
-        clauses.append("(host(f.src_addr) ILIKE %s OR host(f.dst_addr) ILIKE %s OR host(f.exporter) ILIKE %s OR f.src_port::text ILIKE %s OR f.dst_port::text ILIKE %s)")
+        clauses.append("(host(f.src_addr) ILIKE %s OR host(f.dst_addr) ILIKE %s OR host(f.exporter) ILIKE %s OR f.src_port::text ILIKE %s OR f.dst_port::text ILIKE %s OR f.service_port::text ILIKE %s)")
         v = f"%{q}%"
-        params += [v, v, v, v, v]
+        params += [v, v, v, v, v, v]
     if exporter:
         clauses.append("f.exporter = %s::inet")
         params.append(normalize_host(exporter))
@@ -1086,8 +1448,8 @@ def build_flow_filter(
         clauses.append("f.dst_port=%s")
         params.append(dst_port)
     if port is not None:
-        clauses.append("(f.src_port=%s OR f.dst_port=%s)")
-        params += [port, port]
+        clauses.append("(f.service_port=%s OR f.src_port=%s OR f.dst_port=%s)")
+        params += [port, port, port]
     if proto is not None:
         clauses.append("f.proto=%s")
         params.append(proto)
@@ -1138,18 +1500,20 @@ def flows(
     order: Optional[str] = None,
 ):
     clauses, params = build_flow_filter(hours=hours, date_from=date_from, date_to=date_to, exporter=exporter, q=q, src=src, dst=dst, src_port=src_port, dst_port=dst_port, port=port, proto=proto, interface=interface, interface_exporter=interface_exporter, interface_index=interface_index)
+    if not clauses and (sort is None or sort == "received_at"):
+        clauses.append("f.bucket_start >= (SELECT max(bucket_start) - interval '10 minutes' FROM flow_conversations_5m)")
     where = " AND ".join(clauses) if clauses else "TRUE"
     sort_col = FLOW_SORT_COLUMNS.get(sort or "received_at", "f.received_at")
     sort_dir = "ASC" if str(order).lower() == "asc" else "DESC"
     params += [min(max(limit, 1), 100), max(offset, 0)]
     with conn() as c, c.cursor() as cur:
         cur.execute(
-            f"""SELECT f.id,f.received_at,f.flow_time,host(f.exporter) exporter,e.hostname exporter_hostname,f.flow_type,
+            f"""SELECT f.id,f.received_at,f.flow_time,f.first_seen,f.last_seen,f.flow_count,host(f.exporter) exporter,e.hostname exporter_hostname,f.flow_type,
                        host(f.src_addr) src_addr,host(f.dst_addr) dst_addr,f.src_port,f.dst_port,f.proto,f.bytes,f.packets,
-                       f.in_if,f.out_if,
-                       COALESCE(ii.if_name,ii.if_descr) in_if_name, COALESCE(oi.if_name,oi.if_descr) out_if_name,
+                       f.in_if,f.out_if,f.service_port,f.service_side,
+                       CASE WHEN nullif(ii.if_alias,'') IS NOT NULL THEN coalesce(nullif(ii.if_name,''),nullif(ii.if_descr,''),'ifIndex '||f.in_if::text)||' ('||ii.if_alias||')' ELSE COALESCE(NULLIF(ii.if_name,''),NULLIF(ii.if_descr,'')) END in_if_name, CASE WHEN nullif(oi.if_alias,'') IS NOT NULL THEN coalesce(nullif(oi.if_name,''),nullif(oi.if_descr,''),'ifIndex '||f.out_if::text)||' ('||oi.if_alias||')' ELSE COALESCE(NULLIF(oi.if_name,''),NULLIF(oi.if_descr,'')) END out_if_name,
                        f.sampling_rate
-                FROM flows f
+                FROM flow_conversations_5m f
                 LEFT JOIN exporters e ON e.ip=f.exporter
                 LEFT JOIN interfaces ii ON ii.exporter=f.exporter AND ii.if_index=f.in_if
                 LEFT JOIN interfaces oi ON oi.exporter=f.exporter AND oi.if_index=f.out_if
@@ -1181,7 +1545,7 @@ def flows_count(
     with conn() as c, c.cursor() as cur:
         cur.execute(
             f"""SELECT count(*)::bigint total
-                FROM flows f
+                FROM flow_conversations_5m f
                 LEFT JOIN interfaces ii ON ii.exporter=f.exporter AND ii.if_index=f.in_if
                 LEFT JOIN interfaces oi ON oi.exporter=f.exporter AND oi.if_index=f.out_if
                 WHERE {where}""",
@@ -1208,19 +1572,19 @@ def _summary_shape(src: Optional[str], dst: Optional[str]):
     if src and not dst:
         return (
             "source",
-            "host(f.dst_addr) AS peer_addr, NULL::text AS src_addr, host(f.dst_addr) AS dst_addr, f.proto, f.dst_port AS port",
-            "f.dst_addr, f.proto, f.dst_port",
+            "host(f.dst_addr) AS peer_addr, NULL::text AS src_addr, host(f.dst_addr) AS dst_addr, f.proto, COALESCE(f.service_port,f.dst_port,f.src_port) AS port",
+            "f.dst_addr, f.proto, COALESCE(f.service_port,f.dst_port,f.src_port)",
         )
     if dst and not src:
         return (
             "destination",
-            "host(f.src_addr) AS peer_addr, host(f.src_addr) AS src_addr, NULL::text AS dst_addr, f.proto, f.src_port AS port",
-            "f.src_addr, f.proto, f.src_port",
+            "host(f.src_addr) AS peer_addr, host(f.src_addr) AS src_addr, NULL::text AS dst_addr, f.proto, COALESCE(f.service_port,f.src_port,f.dst_port) AS port",
+            "f.src_addr, f.proto, COALESCE(f.service_port,f.src_port,f.dst_port)",
         )
     return (
         "pair",
-        "NULL::text AS peer_addr, host(f.src_addr) AS src_addr, host(f.dst_addr) AS dst_addr, f.proto, f.dst_port AS port",
-        "f.src_addr, f.dst_addr, f.proto, f.dst_port",
+        "NULL::text AS peer_addr, host(f.src_addr) AS src_addr, host(f.dst_addr) AS dst_addr, f.proto, COALESCE(f.service_port,f.dst_port,f.src_port) AS port",
+        "f.src_addr, f.dst_addr, f.proto, COALESCE(f.service_port,f.dst_port,f.src_port)",
     )
 
 
@@ -1256,8 +1620,9 @@ def flows_summary(
             f"""SELECT {select_cols},
                        coalesce(sum(f.bytes),0)::bigint AS bytes,
                        coalesce(sum(f.packets),0)::bigint AS packets,
-                       count(*)::bigint AS flows
-                FROM flows f
+                       coalesce(sum(f.flow_count),0)::bigint AS flows,
+                       max(f.last_seen) AS last_seen
+                FROM flow_conversations_5m f
                 LEFT JOIN interfaces ii ON ii.exporter=f.exporter AND ii.if_index=f.in_if
                 LEFT JOIN interfaces oi ON oi.exporter=f.exporter AND oi.if_index=f.out_if
                 WHERE {where}
@@ -1293,7 +1658,7 @@ def flows_summary_count(
         cur.execute(
             f"""SELECT count(*)::bigint AS total FROM (
                    SELECT 1
-                   FROM flows f
+                   FROM flow_conversations_5m f
                    LEFT JOIN interfaces ii ON ii.exporter=f.exporter AND ii.if_index=f.in_if
                    LEFT JOIN interfaces oi ON oi.exporter=f.exporter AND oi.if_index=f.out_if
                    WHERE {where}
@@ -1325,24 +1690,47 @@ def conversations(
     interface: Optional[str] = None,
     interface_exporter: Optional[str] = None,
     interface_index: Optional[int] = None,
+    group_by: str = Query("ip", pattern="^(ip|interface)$"),
+    in_if: Optional[int] = None,
+    out_if: Optional[int] = None,
 ):
-    """Aggregate directional conversations by Source IP -> Destination IP."""
+    """Aggregate directional conversations by IP pair or input -> output interface."""
     clauses, params = build_flow_filter(
         hours=hours, date_from=date_from, date_to=date_to, exporter=exporter,
         q=q, src=src, dst=dst, src_port=src_port, dst_port=dst_port,
         port=port, proto=proto, interface=interface,
         interface_exporter=interface_exporter, interface_index=interface_index,
     )
+    if in_if is not None:
+        clauses.append("f.in_if=%s"); params.append(in_if)
+    if out_if is not None:
+        clauses.append("f.out_if=%s"); params.append(out_if)
     where = " AND ".join(clauses) if clauses else "TRUE"
     params += [min(max(limit, 1), 100), max(offset, 0)]
     with conn() as c, c.cursor() as cur:
+        if group_by == 'interface':
+            cur.execute(f"""SELECT host(f.exporter) exporter,f.in_if,f.out_if,
+                       CASE WHEN nullif(ii.if_alias,'') IS NOT NULL THEN coalesce(nullif(ii.if_name,''),nullif(ii.if_descr,''),'ifIndex '||coalesce(f.in_if::text,'—'))||' ('||ii.if_alias||')' ELSE coalesce(nullif(ii.if_name,''),nullif(ii.if_descr,''),'ifIndex '||coalesce(f.in_if::text,'—')) END in_if_name,
+                       CASE WHEN nullif(oi.if_alias,'') IS NOT NULL THEN coalesce(nullif(oi.if_name,''),nullif(oi.if_descr,''),'ifIndex '||coalesce(f.out_if::text,'—'))||' ('||oi.if_alias||')' ELSE coalesce(nullif(oi.if_name,''),nullif(oi.if_descr,''),'ifIndex '||coalesce(f.out_if::text,'—')) END out_if_name,
+                       coalesce(nullif(e.hostname,''),host(f.exporter)) device_name,
+                       coalesce(sum(f.bytes),0)::bigint bytes,coalesce(sum(f.packets),0)::bigint packets,
+                       coalesce(sum(f.flow_count),0)::bigint flows,max(f.last_seen) last_seen
+                FROM flow_conversations_5m f
+                LEFT JOIN exporters e ON e.ip=f.exporter
+                LEFT JOIN interfaces ii ON ii.exporter=f.exporter AND ii.if_index=f.in_if
+                LEFT JOIN interfaces oi ON oi.exporter=f.exporter AND oi.if_index=f.out_if
+                WHERE {where}
+                GROUP BY f.exporter,f.in_if,f.out_if,ii.if_name,ii.if_descr,ii.if_alias,oi.if_name,oi.if_descr,oi.if_alias,e.hostname
+                ORDER BY bytes DESC LIMIT %s OFFSET %s""",params)
+            return cur.fetchall()
         cur.execute(
             f"""SELECT host(f.src_addr) AS src_addr,
                        host(f.dst_addr) AS dst_addr,
                        coalesce(sum(f.bytes),0)::bigint AS bytes,
                        coalesce(sum(f.packets),0)::bigint AS packets,
-                       count(*)::bigint AS flows
-                FROM flows f
+                       coalesce(sum(f.flow_count),0)::bigint AS flows,
+                       min(f.first_seen) AS first_seen,max(f.last_seen) AS last_seen
+                FROM flow_conversations_5m f
                 LEFT JOIN interfaces ii ON ii.exporter=f.exporter AND ii.if_index=f.in_if
                 LEFT JOIN interfaces oi ON oi.exporter=f.exporter AND oi.if_index=f.out_if
                 WHERE {where}
@@ -1370,6 +1758,9 @@ def conversations_count(
     interface: Optional[str] = None,
     interface_exporter: Optional[str] = None,
     interface_index: Optional[int] = None,
+    group_by: str = Query("ip", pattern="^(ip|interface)$"),
+    in_if: Optional[int] = None,
+    out_if: Optional[int] = None,
 ):
     clauses, params = build_flow_filter(
         hours=hours, date_from=date_from, date_to=date_to, exporter=exporter,
@@ -1377,16 +1768,19 @@ def conversations_count(
         port=port, proto=proto, interface=interface,
         interface_exporter=interface_exporter, interface_index=interface_index,
     )
+    if in_if is not None: clauses.append("f.in_if=%s"); params.append(in_if)
+    if out_if is not None: clauses.append("f.out_if=%s"); params.append(out_if)
     where = " AND ".join(clauses) if clauses else "TRUE"
+    group_cols = "f.exporter,f.in_if,f.out_if" if group_by=='interface' else "f.src_addr,f.dst_addr"
     with conn() as c, c.cursor() as cur:
         cur.execute(
             f"""SELECT count(*)::bigint AS total FROM (
                    SELECT 1
-                   FROM flows f
+                   FROM flow_conversations_5m f
                    LEFT JOIN interfaces ii ON ii.exporter=f.exporter AND ii.if_index=f.in_if
                    LEFT JOIN interfaces oi ON oi.exporter=f.exporter AND oi.if_index=f.out_if
                    WHERE {where}
-                   GROUP BY f.src_addr, f.dst_addr
+                   GROUP BY {group_cols}
                 ) c""",
             params,
         )
@@ -1418,8 +1812,8 @@ def flows_series(
                          + floor(date_part('minute', f.received_at) / 10) * interval '10 minutes' AS bucket,
                       coalesce(sum(f.bytes),0)::bigint bytes,
                       coalesce(sum(f.packets),0)::bigint packets,
-                      count(*)::bigint flows
-                FROM flows f
+                      coalesce(sum(f.flow_count),0)::bigint flows
+                FROM flow_conversations_5m f
                 LEFT JOIN interfaces ii ON ii.exporter=f.exporter AND ii.if_index=f.in_if
                 LEFT JOIN interfaces oi ON oi.exporter=f.exporter AND oi.if_index=f.out_if
                 WHERE {where}
@@ -1521,113 +1915,121 @@ async def _run_exporter_delete_job(job_id: str, exporter: str):
         _job_update(job_id, status='done', stage='Completed', progress=100,
                     message='Exporter and all related data were deleted', result=result,
                     deleted_flows=result.get('deleted_flows', 0))
-        print(f"[v0.6.2] Exporter purge completed: {exporter}, {result.get('deleted_flows', 0)} flows removed.", flush=True)
+        print(f"[v0.7.7] Exporter purge completed: {exporter}, {result.get('deleted_flows', 0)} flows removed.", flush=True)
     except Exception as exc:
         _job_fail(job_id, exc)
-        print(f"[v0.6.2] Exporter purge failed for {exporter}: {getattr(exc, 'detail', exc)}", flush=True)
+        print(f"[v0.7.7] Exporter purge failed for {exporter}: {getattr(exc, 'detail', exc)}", flush=True)
 
 
 def _purge_exporter_with_progress(exporter: str, job_id: str):
-    """Delete an Idle exporter in observable, bounded batches.
+    exporter=normalize_host(exporter)
+    with psycopg.connect(DB,row_factory=dict_row) as c,c.cursor() as cur:
+        cur.execute('SELECT last_seen FROM exporters WHERE ip=%s::inet FOR UPDATE',(exporter,)); row=cur.fetchone()
+        if not row: raise HTTPException(404,'Exporter not found')
+        cur.execute("SELECT (last_seen < now() - interval '5 minutes') idle FROM exporters WHERE ip=%s::inet",(exporter,))
+        if not cur.fetchone()['idle']: raise HTTPException(409,'Exporter became Active. Stop NetFlow export and try again after it becomes Idle.')
+        cur.execute('SELECT count(*)::bigint rows,coalesce(sum(flow_count),0)::bigint flows FROM flow_conversations_5m WHERE exporter=%s::inet',(exporter,)); meta=cur.fetchone()
+        _job_update(job_id,stage='Deleting conversations',progress=20,message=f"Deleting {int(meta['rows'] or 0):,} aggregated conversation rows")
+        cur.execute('DELETE FROM flow_conversations_5m WHERE exporter=%s::inet',(exporter,)); deleted_rows=cur.rowcount
+        # Clean legacy raw rows only on upgrades where the old table still exists.
+        cur.execute("SELECT to_regclass('public.flows') AS reg")
+        if cur.fetchone()['reg'] is not None:
+            try: cur.execute('DELETE FROM flows WHERE exporter=%s::inet',(exporter,))
+            except Exception: c.rollback()
+        _job_update(job_id,stage='Deleting exporter aggregates',progress=65,message='Deleting exporter/interface aggregates')
+        cur.execute('DELETE FROM flow_agg_exporter_1m WHERE exporter=%s::inet',(exporter,)); deleted_exporter_agg=cur.rowcount
+        cur.execute('DELETE FROM flow_agg_interface_1m WHERE exporter=%s::inet',(exporter,)); deleted_interface_agg=cur.rowcount
+        cur.execute('DELETE FROM interfaces WHERE exporter=%s::inet',(exporter,)); deleted_interfaces=cur.rowcount
+        cur.execute('DELETE FROM exporters WHERE ip=%s::inet',(exporter,))
+        c.commit()
+    SUMMARY_CACHE['data']=None
+    return {'deleted_flows':int(meta['flows'] or 0),'deleted_conversation_rows':deleted_rows,'deleted_interfaces':deleted_interfaces,'deleted_exporter_aggregate_rows':deleted_exporter_agg,'deleted_interface_aggregate_rows':deleted_interface_agg}
 
-    Raw rows are deleted partition-by-partition in small commits so the GUI can
-    report real progress instead of waiting on one long HTTP request. Once raw
-    data is gone, exporter-scoped metadata is removed. Global aggregates are
-    rebuilt by the async job after this function returns.
+
+@app.get("/api/service-labels")
+def service_labels():
+    """Return the effective service-name catalog used by every GUI table.
+
+    Built-in well-known names are the baseline. Custom Port descriptions
+    override them for the same protocol/port without changing stored flow data.
     """
-    exporter = normalize_host(exporter)
-    batch_size = 10000
+    merged = {(int(proto), int(port)): str(name) for (proto, port), name in COMMON_APPS.items()}
+    with conn() as c, c.cursor() as cur:
+        cur.execute("SELECT proto,port,description FROM port_descriptions")
+        for row in cur.fetchall():
+            merged[(int(row['proto']), int(row['port']))] = str(row['description'])
+    return [
+        {"proto": proto, "port": port, "description": description}
+        for (proto, port), description in sorted(merged.items())
+    ]
 
-    with psycopg.connect(DB, row_factory=dict_row) as c, c.cursor() as cur:
-        cur.execute("SELECT last_seen FROM exporters WHERE ip=%s::inet FOR UPDATE", (exporter,))
-        row = cur.fetchone()
-        if not row:
-            raise HTTPException(404, "Exporter not found")
-        cur.execute("SELECT (last_seen < now() - interval '5 minutes') idle FROM exporters WHERE ip=%s::inet", (exporter,))
-        if not cur.fetchone()['idle']:
-            raise HTTPException(409, "Exporter became Active. Stop NetFlow export and try again after it becomes Idle.")
-        cur.execute("SELECT count(*)::bigint total FROM flows WHERE exporter=%s::inet", (exporter,))
-        total_flows = int(cur.fetchone()['total'] or 0)
+
+@app.get("/api/port-descriptions")
+def list_port_descriptions():
+    with conn() as c, c.cursor() as cur:
+        cur.execute("""SELECT id,proto,port,description,created_at,updated_at
+                       FROM port_descriptions ORDER BY proto,port""")
+        rows=cur.fetchall()
+        for row in rows:
+            row['protocol']=protocol_name(row['proto'])
+            row['label']=f"{row['description']} {protocol_name(row['proto'])}/{row['port']}"
+        return rows
+
+
+@app.post("/api/port-descriptions")
+def create_port_descriptions(payload: PortDescriptionBulkRequest):
+    if not payload.items:
+        raise HTTPException(422, "Add at least one port description")
+    if len(payload.items) > 500:
+        raise HTTPException(422, "Maximum 500 port descriptions per request")
+    saved=[]
+    with conn() as c, c.cursor() as cur:
+        for item in payload.items:
+            proto=parse_protocol(item.protocol)
+            if proto is None or proto < 0 or proto > 255:
+                raise HTTPException(422, f"Unsupported protocol: {item.protocol}")
+            description=item.description.strip()
+            if not description:
+                raise HTTPException(422, "Description cannot be empty")
+            cur.execute("""INSERT INTO port_descriptions(proto,port,description) VALUES(%s,%s,%s)
+                           ON CONFLICT(proto,port) DO UPDATE SET description=excluded.description,updated_at=now()
+                           RETURNING id,proto,port,description,created_at,updated_at""",
+                        (proto,item.port,description))
+            saved.append(cur.fetchone())
         c.commit()
+    return {'status':'ok','saved':len(saved),'items':saved}
 
-    _job_update(job_id, stage='Deleting raw flows', progress=8,
-                message=f'Deleting {total_flows:,} raw flows', total_flows=total_flows)
 
-    # Work directly on child partitions so ctid batching is unambiguous.
-    with psycopg.connect(DB, row_factory=dict_row) as c, c.cursor() as cur:
-        cur.execute("""SELECT child.relname AS partition
-                       FROM pg_inherits
-                       JOIN pg_class parent ON pg_inherits.inhparent=parent.oid
-                       JOIN pg_class child ON pg_inherits.inhrelid=child.oid
-                       JOIN pg_namespace ns ON child.relnamespace=ns.oid
-                       WHERE parent.relname='flows' AND ns.nspname='public'
-                       ORDER BY child.relname""")
-        partitions = [r['partition'] for r in cur.fetchall()]
-
-    deleted_flows = 0
-    for part in partitions:
-        while True:
-            with psycopg.connect(DB, row_factory=dict_row) as c, c.cursor() as cur:
-                ident = sql.Identifier(part)
-                q = sql.SQL("""WITH doomed AS (
-                               SELECT ctid FROM {p} WHERE exporter=%s::inet LIMIT %s
-                             )
-                             DELETE FROM {p} f USING doomed d
-                             WHERE f.ctid=d.ctid""").format(p=ident)
-                cur.execute(q, (exporter, batch_size))
-                n = cur.rowcount
-                c.commit()
-            if not n:
-                break
-            deleted_flows += n
-            frac = (deleted_flows / total_flows) if total_flows else 1.0
-            progress = min(70, 8 + int(frac * 62))
-            _job_update(job_id, stage='Deleting raw flows', progress=progress,
-                        message=f'Deleted {deleted_flows:,} of {total_flows:,} raw flows',
-                        deleted_flows=deleted_flows, total_flows=total_flows)
-
-    _job_update(job_id, stage='Deleting interfaces and SNMP', progress=74,
-                message='Deleting interfaces and SNMP metadata')
-    with psycopg.connect(DB, row_factory=dict_row) as c, c.cursor() as cur:
-        # Re-check once more before removing the inventory record.
-        cur.execute("SELECT last_seen FROM exporters WHERE ip=%s::inet FOR UPDATE", (exporter,))
-        row = cur.fetchone()
+@app.put("/api/port-descriptions/{item_id}")
+def update_port_description(item_id: int, payload: PortDescriptionUpdateRequest):
+    proto=parse_protocol(payload.protocol)
+    if proto is None or proto < 0 or proto > 255:
+        raise HTTPException(422, f"Unsupported protocol: {payload.protocol}")
+    description=payload.description.strip()
+    if not description:
+        raise HTTPException(422, "Description cannot be empty")
+    with conn() as c, c.cursor() as cur:
+        try:
+            cur.execute("""UPDATE port_descriptions SET proto=%s,port=%s,description=%s,updated_at=now()
+                           WHERE id=%s RETURNING id,proto,port,description,created_at,updated_at""",
+                        (proto,payload.port,description,item_id))
+        except psycopg.errors.UniqueViolation:
+            raise HTTPException(409, f"{protocol_name(proto)}/{payload.port} already exists")
+        row=cur.fetchone()
         if not row:
-            raise HTTPException(404, "Exporter disappeared during purge")
-        cur.execute("SELECT (last_seen < now() - interval '5 minutes') idle FROM exporters WHERE ip=%s::inet", (exporter,))
-        if not cur.fetchone()['idle']:
-            raise HTTPException(409, "Exporter became Active during deletion. Purge stopped; disable NetFlow export and run Delete again.")
-
-        cur.execute("DELETE FROM interfaces WHERE exporter=%s::inet", (exporter,))
-        deleted_interfaces = cur.rowcount
-        _job_update(job_id, stage='Deleting exporter aggregates', progress=78,
-                    message='Deleting exporter/interface aggregates')
-        cur.execute("DELETE FROM flow_agg_exporter_1m WHERE exporter=%s::inet", (exporter,))
-        deleted_exporter_agg = cur.rowcount
-        cur.execute("DELETE FROM flow_agg_interface_1m WHERE exporter=%s::inet", (exporter,))
-        deleted_interface_agg = cur.rowcount
-
-        _job_update(job_id, stage='Deleting exporter', progress=84,
-                    message='Deleting exporter inventory record')
-        cur.execute("DELETE FROM exporters WHERE ip=%s::inet", (exporter,))
-        if cur.rowcount != 1:
-            raise RuntimeError(f"Exporter purge failed for {exporter}")
+            raise HTTPException(404, "Port description not found")
         c.commit()
-
-    SUMMARY_CACHE['data'] = None
-    return {
-        'status': 'deleted',
-        'exporter': exporter,
-        'deleted_flows': deleted_flows,
-        'deleted_interfaces': deleted_interfaces,
-        'deleted_exporter_aggregates': deleted_exporter_agg,
-        'deleted_interface_aggregates': deleted_interface_agg,
-    }
+        return row
 
 
-@app.get("/api/database-size")
-def database_size():
-    return storage_breakdown()
+@app.delete("/api/port-descriptions/{item_id}")
+def delete_port_description(item_id: int):
+    with conn() as c, c.cursor() as cur:
+        cur.execute("DELETE FROM port_descriptions WHERE id=%s RETURNING id",(item_id,))
+        if not cur.fetchone():
+            raise HTTPException(404, "Port description not found")
+        c.commit()
+    return {'status':'ok'}
 
 
 @app.get("/api/settings")
@@ -1680,7 +2082,7 @@ async def update_retention(request: Request):
     raw = raw_days * 24 + raw_hours
     stats = stats_days * 24 + stats_hours
     if raw < 1:
-        raise HTTPException(422, "Raw flows retention must be at least 1 hour")
+        raise HTTPException(422, "Detailed conversations retention must be at least 1 hour")
     if stats < 6:
         raise HTTPException(422, "Statistics retention must be at least 6 hours")
 

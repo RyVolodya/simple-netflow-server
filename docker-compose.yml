@@ -34,24 +34,64 @@ services:
       - flow_spool:/data
     networks: [simple-netflow]
 
+  spool-guard:
+    image: alpine:3.20
+    restart: unless-stopped
+    pid: "service:collector"
+    environment:
+      SPOOL_HARD_LIMIT_MB: ${SPOOL_HARD_LIMIT_MB:-1024}
+      SPOOL_RESUME_MB: ${SPOOL_RESUME_MB:-768}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        stopped=0
+        while true; do
+          used=$$(du -sm /data 2>/dev/null | awk '{print $$1}')
+          used=$${used:-0}
+          if [ "$$stopped" -eq 0 ] && [ "$$used" -ge "$$SPOOL_HARD_LIMIT_MB" ]; then
+            echo "Spool guard: $${used}MB >= $${SPOOL_HARD_LIMIT_MB}MB; pausing collector"
+            kill -STOP 1 || true
+            stopped=1
+          elif [ "$$stopped" -eq 1 ] && [ "$$used" -le "$$SPOOL_RESUME_MB" ]; then
+            echo "Spool guard: $${used}MB <= $${SPOOL_RESUME_MB}MB; resuming collector"
+            kill -CONT 1 || true
+            stopped=0
+          fi
+          sleep 10
+        done
+    volumes:
+      - flow_spool:/data:ro
+    depends_on:
+      collector:
+        condition: service_started
+    networks: [simple-netflow]
+
   backend:
     build: ./backend
     restart: unless-stopped
     environment:
       DATABASE_URL: postgresql://netflow:netflow@postgres:5432/netflow
       FLOW_FILE: /data/flows.jsonl
+      SPOOL_ROTATE_BYTES: ${SPOOL_ROTATE_BYTES:-134217728}
+      ACTIVE_CACHE_FLUSH_SECONDS: ${ACTIVE_CACHE_FLUSH_SECONDS:-10}
+      ACTIVE_CACHE_MAX_RECORDS: ${ACTIVE_CACHE_MAX_RECORDS:-10000}
+      COLLECTOR_PID: 1
       RETENTION_DAYS: 30
-      RAW_RETENTION_HOURS: 12
+      RAW_RETENTION_HOURS: 24
       STATS_RETENTION_HOURS: 720
-      APP_VERSION: 0.6.2
+      APP_VERSION: 0.7.7
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-netflow}
       SESSION_HOURS: ${SESSION_HOURS:-24}
     depends_on:
       postgres:
         condition: service_healthy
+      collector:
+        condition: service_started
+    pid: "service:collector"
     volumes:
-      - flow_spool:/data:ro
+      - flow_spool:/data
     networks: [simple-netflow]
 
   frontend:
