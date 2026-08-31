@@ -1,3 +1,15 @@
+## v0.7.8
+
+- Fixed the root cause of unbounded `flows.jsonl` growth under sustained NetFlow load.
+- Reworked the spool ingester into an aggressive catch-up loop: it no longer sleeps for the full micro-batch interval while unread bytes are pending.
+- Kept crash-safe EOF rotation, but made spool state transitions atomic in PostgreSQL to remove offset/rotation crash windows.
+- Added automatic recovery when the persisted active offset is larger than the current spool file (truncate/new-generation recovery).
+- Strengthened `spool-guard`: checks every second, pauses collector at 512 MiB by default, resumes below 384 MiB, and always sends `CONT` below the resume watermark so guard restarts cannot leave the collector paused.
+- Backend now explicitly depends on `spool-guard`, ensuring the guard is started by normal `docker compose up`.
+- Added `/api/spool-status` and spool data to `/api/system-status`: state, total bytes, committed offset, pending bytes, rotation bytes, thresholds and collector process state.
+- Added a GUI Spool health indicator showing total/pending backlog.
+- Existing PostgreSQL and Docker volumes are preserved; no database reset is required.
+
 ## v0.7.7
 
 - Optimized PostgreSQL conversation storage for HOT updates and lower write amplification.

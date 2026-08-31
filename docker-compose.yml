@@ -39,26 +39,25 @@ services:
     restart: unless-stopped
     pid: "service:collector"
     environment:
-      SPOOL_HARD_LIMIT_MB: ${SPOOL_HARD_LIMIT_MB:-1024}
-      SPOOL_RESUME_MB: ${SPOOL_RESUME_MB:-768}
+      SPOOL_HARD_LIMIT_MB: ${SPOOL_HARD_LIMIT_MB:-512}
+      SPOOL_RESUME_MB: ${SPOOL_RESUME_MB:-384}
     command:
       - /bin/sh
       - -c
       - |
-        stopped=0
+        echo "Spool guard started: hard=$${SPOOL_HARD_LIMIT_MB}MB resume=$${SPOOL_RESUME_MB}MB"
         while true; do
           used=$$(du -sm /data 2>/dev/null | awk '{print $$1}')
           used=$${used:-0}
-          if [ "$$stopped" -eq 0 ] && [ "$$used" -ge "$$SPOOL_HARD_LIMIT_MB" ]; then
-            echo "Spool guard: $${used}MB >= $${SPOOL_HARD_LIMIT_MB}MB; pausing collector"
-            kill -STOP 1 || true
-            stopped=1
-          elif [ "$$stopped" -eq 1 ] && [ "$$used" -le "$$SPOOL_RESUME_MB" ]; then
-            echo "Spool guard: $${used}MB <= $${SPOOL_RESUME_MB}MB; resuming collector"
-            kill -CONT 1 || true
-            stopped=0
+          if [ "$$used" -ge "$$SPOOL_HARD_LIMIT_MB" ]; then
+            echo "Spool guard: $${used}MB >= $${SPOOL_HARD_LIMIT_MB}MB; pausing collector PID 1"
+            kill -STOP 1 2>/dev/null || true
+          elif [ "$$used" -le "$$SPOOL_RESUME_MB" ]; then
+            # Always send CONT below the resume watermark. This also recovers a
+            # collector left stopped if the guard container itself restarted.
+            kill -CONT 1 2>/dev/null || true
           fi
-          sleep 10
+          sleep 1
         done
     volumes:
       - flow_spool:/data:ro
@@ -74,13 +73,15 @@ services:
       DATABASE_URL: postgresql://netflow:netflow@postgres:5432/netflow
       FLOW_FILE: /data/flows.jsonl
       SPOOL_ROTATE_BYTES: ${SPOOL_ROTATE_BYTES:-134217728}
+      SPOOL_HARD_LIMIT_MB: ${SPOOL_HARD_LIMIT_MB:-512}
+      SPOOL_RESUME_MB: ${SPOOL_RESUME_MB:-384}
       ACTIVE_CACHE_FLUSH_SECONDS: ${ACTIVE_CACHE_FLUSH_SECONDS:-10}
       ACTIVE_CACHE_MAX_RECORDS: ${ACTIVE_CACHE_MAX_RECORDS:-10000}
       COLLECTOR_PID: 1
       RETENTION_DAYS: 30
       RAW_RETENTION_HOURS: 24
       STATS_RETENTION_HOURS: 720
-      APP_VERSION: 0.7.7
+      APP_VERSION: 0.7.8
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-netflow}
       SESSION_HOURS: ${SESSION_HOURS:-24}
@@ -88,6 +89,8 @@ services:
       postgres:
         condition: service_healthy
       collector:
+        condition: service_started
+      spool-guard:
         condition: service_started
     pid: "service:collector"
     volumes:

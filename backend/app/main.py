@@ -24,11 +24,13 @@ from psycopg import sql
 DB = os.getenv("DATABASE_URL", "postgresql://netflow:netflow@postgres:5432/netflow")
 FLOW_FILE = os.getenv("FLOW_FILE", "/data/flows.jsonl")
 SPOOL_ROTATE_BYTES = max(16 * 1024 * 1024, int(os.getenv("SPOOL_ROTATE_BYTES", str(128 * 1024 * 1024))))
+SPOOL_HARD_LIMIT_MB = max(64, int(os.getenv("SPOOL_HARD_LIMIT_MB", "512")))
+SPOOL_RESUME_MB = max(32, min(SPOOL_HARD_LIMIT_MB - 1, int(os.getenv("SPOOL_RESUME_MB", "384"))))
 COLLECTOR_PID = int(os.getenv("COLLECTOR_PID", "1"))
 DEFAULT_RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "30"))
 DEFAULT_RAW_RETENTION_HOURS = int(os.getenv("RAW_RETENTION_HOURS", "24"))
 DEFAULT_STATS_RETENTION_HOURS = int(os.getenv("STATS_RETENTION_HOURS", "720"))
-VERSION = os.getenv("APP_VERSION", "0.7.7")
+VERSION = os.getenv("APP_VERSION", "0.7.8")
 DEFAULT_ADMIN_USER = os.getenv("ADMIN_USERNAME", "admin")
 DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "netflow")
 SESSION_HOURS = int(os.getenv("SESSION_HOURS", "24"))
@@ -308,7 +310,7 @@ def ensure_partitioned_flows():
                 cur.execute(f"CREATE INDEX {name} ON flows ({cols})")
             c.commit(); return
 
-        print('[v0.7.7] Migrating raw flows to daily partitions. This is a one-time operation...', flush=True)
+        print('[v0.7.8] Migrating raw flows to daily partitions. This is a one-time operation...', flush=True)
         cur.execute("SELECT count(*)::bigint n,min(received_at) mn,max(received_at) mx FROM flows")
         meta=cur.fetchone(); old_count=int(meta['n'])
         cur.execute("ALTER TABLE flows RENAME TO flows_legacy_052")
@@ -333,7 +335,7 @@ def ensure_partitioned_flows():
         for name,cols in OPTIMIZED_FLOW_INDEXES:
             cur.execute(f"CREATE INDEX {name} ON flows ({cols})")
         c.commit()
-        print(f'[v0.7.7] Partition migration complete: {new_count} flows preserved.', flush=True)
+        print(f'[v0.7.8] Partition migration complete: {new_count} flows preserved.', flush=True)
 
 
 def drop_expired_flow_partitions(cur, raw_hours):
@@ -714,8 +716,84 @@ def _spool_rotation_state():
 
 
 def _clear_spool_rotation_state():
-    set_setting("flow_spool_rotation_file", "")
-    set_setting("flow_spool_rotation_offset", 0)
+    _set_spool_state(rotation_file="", rotation_offset=0)
+
+
+def _set_spool_state(active_offset=None, rotation_file=None, rotation_offset=None):
+    """Persist spool state changes in one PostgreSQL transaction.
+
+    This prevents crash windows where rotation metadata was cleared but the
+    active offset still pointed into the previous file generation.
+    """
+    updates=[]
+    if active_offset is not None:
+        updates.append(("flow_spool_offset", str(max(0, int(active_offset)))))
+    if rotation_file is not None:
+        updates.append(("flow_spool_rotation_file", str(rotation_file)))
+    if rotation_offset is not None:
+        updates.append(("flow_spool_rotation_offset", str(max(0, int(rotation_offset)))))
+    if not updates:
+        return
+    with conn() as c, c.cursor() as cur:
+        cur.executemany(
+            """INSERT INTO app_settings(key,value) VALUES(%s,%s)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=now()""",
+            updates,
+        )
+
+
+def _spool_snapshot():
+    """Return current durable spool/backlog state for health reporting."""
+    try:
+        active_size=os.path.getsize(FLOW_FILE) if os.path.exists(FLOW_FILE) else 0
+    except OSError:
+        active_size=0
+    try:
+        active_offset=max(0, int(get_setting("flow_spool_offset", 0) or 0))
+    except Exception:
+        active_offset=0
+    try:
+        rotation_file, rotation_offset=_spool_rotation_state()
+    except Exception:
+        rotation_file, rotation_offset="", 0
+    try:
+        rotation_size=os.path.getsize(rotation_file) if rotation_file and os.path.exists(rotation_file) else 0
+    except OSError:
+        rotation_size=0
+    pending=max(0, active_size-active_offset) + max(0, rotation_size-rotation_offset)
+    total=active_size+rotation_size
+    if active_offset > active_size and not rotation_file:
+        state="offset_mismatch"
+    elif rotation_file:
+        state="rotation_recovery"
+    elif total >= SPOOL_HARD_LIMIT_MB*1024*1024:
+        state="hard_limit"
+    elif pending >= SPOOL_ROTATE_BYTES:
+        state="backlog"
+    else:
+        state="healthy"
+    collector_state="unknown"
+    try:
+        with open(f"/proc/{COLLECTOR_PID}/status", "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                if line.startswith("State:"):
+                    collector_state=line.split(":",1)[1].strip()
+                    break
+    except Exception:
+        pass
+    return {
+        "state": state,
+        "active_size": active_size,
+        "committed_offset": active_offset,
+        "rotation_size": rotation_size,
+        "rotation_offset": rotation_offset,
+        "pending_bytes": pending,
+        "total_spool_bytes": total,
+        "rotate_bytes": SPOOL_ROTATE_BYTES,
+        "hard_limit_bytes": SPOOL_HARD_LIMIT_MB*1024*1024,
+        "resume_bytes": SPOOL_RESUME_MB*1024*1024,
+        "collector_process_state": collector_state,
+    }
 
 
 def _ingest_file_tail(path, start_pos, offset_key="flow_spool_rotation_offset"):
@@ -771,11 +849,10 @@ async def _recover_rotated_spool():
                 await asyncio.sleep(0.05)
             final_pos=await asyncio.to_thread(_ingest_file_tail, rotated, offset, "flow_spool_rotation_offset")
             os.unlink(rotated)
-        await asyncio.to_thread(_clear_spool_rotation_state)
-        await asyncio.to_thread(set_setting, "flow_spool_offset", 0)
-        print(f"[v0.7.7] recovered spool rotation: {rotated}", flush=True)
+        await asyncio.to_thread(_set_spool_state, 0, "", 0)
+        print(f"[v0.7.8] recovered spool rotation: {rotated}", flush=True)
     except Exception as e:
-        print(f"[v0.7.7] spool rotation recovery error: {e}", flush=True)
+        print(f"[v0.7.8] spool rotation recovery error: {e}", flush=True)
         raise
 
 
@@ -800,8 +877,7 @@ async def _rotate_consumed_spool(path, pos):
         return pos, False
 
     # Persist recovery metadata BEFORE changing the filesystem.
-    await asyncio.to_thread(set_setting, "flow_spool_rotation_file", rotated)
-    await asyncio.to_thread(set_setting, "flow_spool_rotation_offset", int(pos))
+    await asyncio.to_thread(_set_spool_state, None, rotated, int(pos))
     os.replace(path, rotated)
 
     try:
@@ -828,9 +904,8 @@ async def _rotate_consumed_spool(path, pos):
     final_pos=await asyncio.to_thread(_ingest_file_tail, rotated, pos, "flow_spool_rotation_offset")
     if os.path.exists(rotated):
         os.unlink(rotated)
-    await asyncio.to_thread(_clear_spool_rotation_state)
-    await asyncio.to_thread(set_setting, "flow_spool_offset", 0)
-    print(f"[v0.7.7] spool rotated and compacted: freed {final_pos} bytes", flush=True)
+    await asyncio.to_thread(_set_spool_state, 0, "", 0)
+    print(f"[v0.7.8] spool rotated and compacted: freed {final_pos} bytes", flush=True)
     return 0, True
 
 
@@ -880,8 +955,13 @@ async def spool_ingester():
                 continue
             size=os.path.getsize(path)
             if size < pos:
+                # Active file generation changed (manual truncate, completed
+                # rotation or crash recovery).  The old committed prefix no
+                # longer exists, so start at byte 0 of the new generation.
+                print(f"[v0.7.8] spool offset mismatch recovered: offset={pos} size={size}; resetting to 0", flush=True)
                 pos=0
-                await asyncio.to_thread(set_setting, "flow_spool_offset", 0)
+                batch=[]
+                await asyncio.to_thread(_set_spool_state, 0, "", 0)
             with open(path,'r',encoding='utf-8',errors='ignore') as f:
                 f.seek(pos)
                 while True:
@@ -911,11 +991,21 @@ async def spool_ingester():
                 batch=[]
                 last_flush=asyncio.get_running_loop().time()
         except Exception as e:
-            print(f"[v0.7.7] spool ingest error: {e}", flush=True)
-        # Read/commit in short micro-batches instead of touching PostgreSQL for
-        # every burst. Five seconds keeps the UI near-real-time while greatly
-        # reducing UPSERT/WAL churn.
-        await asyncio.sleep(ACTIVE_CACHE_FLUSH_SECONDS)
+            print(f"[v0.7.8] spool ingest error: {e}", flush=True)
+            await asyncio.sleep(1.0)
+            continue
+
+        # v0.7.8 catch-up loop: never sleep for the full cache flush interval
+        # while bytes are waiting in the spool.  The old 10-second sleep could
+        # keep the reader permanently behind a busy collector, which meant the
+        # EOF-only rotation condition was never reached and flows.jsonl grew
+        # without bound.
+        try:
+            current_size=os.path.getsize(path) if os.path.exists(path) else 0
+        except OSError:
+            current_size=0
+        pending=max(0, current_size-pos)
+        await asyncio.sleep(0.02 if pending else 0.25)
 
 
 async def retention_worker():
@@ -930,13 +1020,13 @@ async def retention_worker():
                 cur.execute("SELECT to_regclass('public.flows') AS reg")
                 if cur.fetchone()['reg'] is not None:
                     try: drop_expired_flow_partitions(cur,detailed_hours)
-                    except Exception as e: print(f'[v0.7.7] legacy raw cleanup warning: {e}',flush=True)
+                    except Exception as e: print(f'[v0.7.8] legacy raw cleanup warning: {e}',flush=True)
                 for table in ['flow_agg_total_1m','flow_agg_src_1m','flow_agg_dst_1m','flow_agg_exporter_1m','flow_agg_app_1m','flow_agg_interface_1m']:
                     cur.execute(f"DELETE FROM {table} WHERE bucket < now() - (%s || ' hours')::interval",(stats_hours,))
                 cur.execute('DELETE FROM sessions WHERE expires_at < now()')
                 SUMMARY_CACHE['data']=None
         except Exception as e:
-            print(f'[v0.7.7] retention error: {e}',flush=True)
+            print(f'[v0.7.8] retention error: {e}',flush=True)
         await asyncio.sleep(3600)
 
 
@@ -976,7 +1066,7 @@ def rebuild_aggregates(force=False):
             cur.execute('TRUNCATE flow_agg_total_1m,flow_agg_src_1m,flow_agg_dst_1m,flow_agg_exporter_1m,flow_agg_app_1m,flow_agg_interface_1m')
         cur.execute('SELECT EXISTS(SELECT 1 FROM flow_conversations_5m) has')
         if not cur.fetchone()['has']: c.commit(); return
-        print('[v0.7.7] rebuilding dashboard aggregates from 5-minute conversations...',flush=True)
+        print('[v0.7.8] rebuilding dashboard aggregates from 5-minute conversations...',flush=True)
         cur.execute("""INSERT INTO flow_agg_total_1m(bucket,bytes,packets,flows)
           SELECT date_trunc('minute',last_seen),sum(bytes),sum(packets),sum(flow_count) FROM flow_conversations_5m GROUP BY 1""")
         cur.execute("""INSERT INTO flow_agg_src_1m(bucket,src_addr,bytes,packets,flows)
@@ -1039,10 +1129,10 @@ async def lifespan(app: FastAPI):
             break
         except Exception as e:
             last_error=e
-            print(f'[v0.7.7] startup attempt {attempt+1}/30 failed: {e}', flush=True)
+            print(f'[v0.7.8] startup attempt {attempt+1}/30 failed: {e}', flush=True)
             await asyncio.sleep(1)
     if not initialized:
-        raise RuntimeError(f'v0.7.7 storage initialization failed: {last_error}')
+        raise RuntimeError(f'v0.7.8 storage initialization failed: {last_error}')
     t1 = asyncio.create_task(spool_ingester())
     t2 = asyncio.create_task(retention_worker())
     yield
@@ -1243,12 +1333,22 @@ def system_status():
         collector_online = os.path.exists(FLOW_FILE)
     except Exception:
         collector_online=False
+    try:
+        spool=_spool_snapshot()
+    except Exception:
+        spool={"state":"unknown","pending_bytes":0,"total_spool_bytes":0}
     return {
         'backend': {'online': True},
         'database': {'online': db_online},
         'collector': {'online': collector_online},
+        'spool': spool,
         'version': VERSION,
     }
+
+
+@app.get("/api/spool-status")
+def spool_status():
+    return _spool_snapshot()
 
 
 @app.get("/api/health")
@@ -1915,10 +2015,10 @@ async def _run_exporter_delete_job(job_id: str, exporter: str):
         _job_update(job_id, status='done', stage='Completed', progress=100,
                     message='Exporter and all related data were deleted', result=result,
                     deleted_flows=result.get('deleted_flows', 0))
-        print(f"[v0.7.7] Exporter purge completed: {exporter}, {result.get('deleted_flows', 0)} flows removed.", flush=True)
+        print(f"[v0.7.8] Exporter purge completed: {exporter}, {result.get('deleted_flows', 0)} flows removed.", flush=True)
     except Exception as exc:
         _job_fail(job_id, exc)
-        print(f"[v0.7.7] Exporter purge failed for {exporter}: {getattr(exc, 'detail', exc)}", flush=True)
+        print(f"[v0.7.8] Exporter purge failed for {exporter}: {getattr(exc, 'detail', exc)}", flush=True)
 
 
 def _purge_exporter_with_progress(exporter: str, job_id: str):
