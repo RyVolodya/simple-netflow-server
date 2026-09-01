@@ -9,6 +9,7 @@ import secrets
 import signal
 import time
 import socket
+import threading
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
@@ -30,17 +31,19 @@ COLLECTOR_PID = int(os.getenv("COLLECTOR_PID", "1"))
 DEFAULT_RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "30"))
 DEFAULT_RAW_RETENTION_HOURS = int(os.getenv("RAW_RETENTION_HOURS", "24"))
 DEFAULT_STATS_RETENTION_HOURS = int(os.getenv("STATS_RETENTION_HOURS", "720"))
-VERSION = os.getenv("APP_VERSION", "0.7.8")
+VERSION = os.getenv("APP_VERSION", "0.7.11")
 DEFAULT_ADMIN_USER = os.getenv("ADMIN_USERNAME", "admin")
 DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "netflow")
 SESSION_HOURS = int(os.getenv("SESSION_HOURS", "24"))
 IDLE_SECONDS = 300
 ACTIVE_CACHE_FLUSH_SECONDS = max(1.0, float(os.getenv("ACTIVE_CACHE_FLUSH_SECONDS", "10")))
 ACTIVE_CACHE_MAX_RECORDS = max(500, int(os.getenv("ACTIVE_CACHE_MAX_RECORDS", "10000")))
+DASHBOARD_SUMMARY_CACHE_SECONDS = max(5.0, float(os.getenv("DASHBOARD_SUMMARY_CACHE_SECONDS", "30")))
 
 
 LIVE_SUBSCRIBERS: set[asyncio.Queue] = set()
 SUMMARY_CACHE = {'ts': 0.0, 'hours': None, 'data': None}
+SUMMARY_CACHE_LOCK = threading.Lock()
 EXPORTER_DELETE_JOBS = {}
 EXPORTER_DELETE_TASKS = {}
 
@@ -310,7 +313,7 @@ def ensure_partitioned_flows():
                 cur.execute(f"CREATE INDEX {name} ON flows ({cols})")
             c.commit(); return
 
-        print('[v0.7.8] Migrating raw flows to daily partitions. This is a one-time operation...', flush=True)
+        print('[v0.7.11] Migrating raw flows to daily partitions. This is a one-time operation...', flush=True)
         cur.execute("SELECT count(*)::bigint n,min(received_at) mn,max(received_at) mx FROM flows")
         meta=cur.fetchone(); old_count=int(meta['n'])
         cur.execute("ALTER TABLE flows RENAME TO flows_legacy_052")
@@ -335,7 +338,7 @@ def ensure_partitioned_flows():
         for name,cols in OPTIMIZED_FLOW_INDEXES:
             cur.execute(f"CREATE INDEX {name} ON flows ({cols})")
         c.commit()
-        print(f'[v0.7.8] Partition migration complete: {new_count} flows preserved.', flush=True)
+        print(f'[v0.7.11] Partition migration complete: {new_count} flows preserved.', flush=True)
 
 
 def drop_expired_flow_partitions(cur, raw_hours):
@@ -850,9 +853,9 @@ async def _recover_rotated_spool():
             final_pos=await asyncio.to_thread(_ingest_file_tail, rotated, offset, "flow_spool_rotation_offset")
             os.unlink(rotated)
         await asyncio.to_thread(_set_spool_state, 0, "", 0)
-        print(f"[v0.7.8] recovered spool rotation: {rotated}", flush=True)
+        print(f"[v0.7.11] recovered spool rotation: {rotated}", flush=True)
     except Exception as e:
-        print(f"[v0.7.8] spool rotation recovery error: {e}", flush=True)
+        print(f"[v0.7.11] spool rotation recovery error: {e}", flush=True)
         raise
 
 
@@ -905,7 +908,7 @@ async def _rotate_consumed_spool(path, pos):
     if os.path.exists(rotated):
         os.unlink(rotated)
     await asyncio.to_thread(_set_spool_state, 0, "", 0)
-    print(f"[v0.7.8] spool rotated and compacted: freed {final_pos} bytes", flush=True)
+    print(f"[v0.7.11] spool rotated and compacted: freed {final_pos} bytes", flush=True)
     return 0, True
 
 
@@ -958,7 +961,7 @@ async def spool_ingester():
                 # Active file generation changed (manual truncate, completed
                 # rotation or crash recovery).  The old committed prefix no
                 # longer exists, so start at byte 0 of the new generation.
-                print(f"[v0.7.8] spool offset mismatch recovered: offset={pos} size={size}; resetting to 0", flush=True)
+                print(f"[v0.7.11] spool offset mismatch recovered: offset={pos} size={size}; resetting to 0", flush=True)
                 pos=0
                 batch=[]
                 await asyncio.to_thread(_set_spool_state, 0, "", 0)
@@ -991,7 +994,7 @@ async def spool_ingester():
                 batch=[]
                 last_flush=asyncio.get_running_loop().time()
         except Exception as e:
-            print(f"[v0.7.8] spool ingest error: {e}", flush=True)
+            print(f"[v0.7.11] spool ingest error: {e}", flush=True)
             await asyncio.sleep(1.0)
             continue
 
@@ -1020,13 +1023,13 @@ async def retention_worker():
                 cur.execute("SELECT to_regclass('public.flows') AS reg")
                 if cur.fetchone()['reg'] is not None:
                     try: drop_expired_flow_partitions(cur,detailed_hours)
-                    except Exception as e: print(f'[v0.7.8] legacy raw cleanup warning: {e}',flush=True)
+                    except Exception as e: print(f'[v0.7.11] legacy raw cleanup warning: {e}',flush=True)
                 for table in ['flow_agg_total_1m','flow_agg_src_1m','flow_agg_dst_1m','flow_agg_exporter_1m','flow_agg_app_1m','flow_agg_interface_1m']:
                     cur.execute(f"DELETE FROM {table} WHERE bucket < now() - (%s || ' hours')::interval",(stats_hours,))
                 cur.execute('DELETE FROM sessions WHERE expires_at < now()')
                 SUMMARY_CACHE['data']=None
         except Exception as e:
-            print(f'[v0.7.8] retention error: {e}',flush=True)
+            print(f'[v0.7.11] retention error: {e}',flush=True)
         await asyncio.sleep(3600)
 
 
@@ -1066,7 +1069,7 @@ def rebuild_aggregates(force=False):
             cur.execute('TRUNCATE flow_agg_total_1m,flow_agg_src_1m,flow_agg_dst_1m,flow_agg_exporter_1m,flow_agg_app_1m,flow_agg_interface_1m')
         cur.execute('SELECT EXISTS(SELECT 1 FROM flow_conversations_5m) has')
         if not cur.fetchone()['has']: c.commit(); return
-        print('[v0.7.8] rebuilding dashboard aggregates from 5-minute conversations...',flush=True)
+        print('[v0.7.11] rebuilding dashboard aggregates from 5-minute conversations...',flush=True)
         cur.execute("""INSERT INTO flow_agg_total_1m(bucket,bytes,packets,flows)
           SELECT date_trunc('minute',last_seen),sum(bytes),sum(packets),sum(flow_count) FROM flow_conversations_5m GROUP BY 1""")
         cur.execute("""INSERT INTO flow_agg_src_1m(bucket,src_addr,bytes,packets,flows)
@@ -1129,10 +1132,10 @@ async def lifespan(app: FastAPI):
             break
         except Exception as e:
             last_error=e
-            print(f'[v0.7.8] startup attempt {attempt+1}/30 failed: {e}', flush=True)
+            print(f'[v0.7.11] startup attempt {attempt+1}/30 failed: {e}', flush=True)
             await asyncio.sleep(1)
     if not initialized:
-        raise RuntimeError(f'v0.7.8 storage initialization failed: {last_error}')
+        raise RuntimeError(f'v0.7.11 storage initialization failed: {last_error}')
     t1 = asyncio.create_task(spool_ingester())
     t2 = asyncio.create_task(retention_worker())
     yield
@@ -1386,23 +1389,42 @@ async def live_events():
     )
 
 
+@app.get("/api/dashboard-summary")
 @app.get("/api/summary")
-def summary(hours: int = 24):
+def dashboard_summary(hours: int = 24):
+    """Return all Dashboard cards from one cached backend snapshot.
+
+    COUNT(DISTINCT src/dst) becomes expensive once the 1-minute aggregate
+    tables contain hundreds of thousands of rows.  Keep one shared result
+    for a short TTL and serialize cache misses so concurrent browser/SSE
+    requests cannot launch the same PostgreSQL scans in parallel.
+    """
     h=min(max(hours,1),24*365)
     now=time.monotonic()
-    if SUMMARY_CACHE['data'] is not None and SUMMARY_CACHE['hours']==h and now-SUMMARY_CACHE['ts']<1.0:
-        return SUMMARY_CACHE['data']
-    with conn() as c, c.cursor() as cur:
-        cur.execute("""SELECT coalesce(sum(flows),0)::bigint flows,coalesce(sum(bytes),0)::bigint bytes,coalesce(sum(packets),0)::bigint packets
-                       FROM flow_agg_total_1m WHERE bucket>=now()-(%s || ' hours')::interval""", (h,))
-        r=cur.fetchone()
-        cur.execute("SELECT count(DISTINCT exporter)::bigint n FROM flow_agg_exporter_1m WHERE bucket>=now()-(%s || ' hours')::interval",(h,)); r['exporters']=cur.fetchone()['n']
-        cur.execute("SELECT count(*)::bigint n FROM interfaces"); r['interfaces']=cur.fetchone()['n']
-        cur.execute("SELECT count(DISTINCT src_addr)::bigint n FROM flow_agg_src_1m WHERE bucket>=now()-(%s || ' hours')::interval",(h,)); r['sources']=cur.fetchone()['n']
-        cur.execute("SELECT count(DISTINCT dst_addr)::bigint n FROM flow_agg_dst_1m WHERE bucket>=now()-(%s || ' hours')::interval",(h,)); r['destinations']=cur.fetchone()['n']
-        cur.execute("SELECT pg_database_size(current_database())::bigint bytes"); r['database_bytes']=cur.fetchone()['bytes']
-        data=dict(r)
-        SUMMARY_CACHE.update({'ts':now,'hours':h,'data':data})
+    data=SUMMARY_CACHE.get('data')
+    if data is not None and SUMMARY_CACHE.get('hours')==h and now-SUMMARY_CACHE.get('ts',0.0)<DASHBOARD_SUMMARY_CACHE_SECONDS:
+        return data
+
+    # Single-flight: only one worker is allowed to refresh the expensive
+    # summary. Waiting workers re-check the cache after acquiring the lock.
+    with SUMMARY_CACHE_LOCK:
+        now=time.monotonic()
+        data=SUMMARY_CACHE.get('data')
+        if data is not None and SUMMARY_CACHE.get('hours')==h and now-SUMMARY_CACHE.get('ts',0.0)<DASHBOARD_SUMMARY_CACHE_SECONDS:
+            return data
+
+        with conn() as c, c.cursor() as cur:
+            cur.execute("""SELECT coalesce(sum(flows),0)::bigint flows,coalesce(sum(bytes),0)::bigint bytes,coalesce(sum(packets),0)::bigint packets
+                           FROM flow_agg_total_1m WHERE bucket>=now()-(%s || ' hours')::interval""", (h,))
+            r=cur.fetchone()
+            cur.execute("SELECT count(DISTINCT exporter)::bigint n FROM flow_agg_exporter_1m WHERE bucket>=now()-(%s || ' hours')::interval",(h,)); r['exporters']=cur.fetchone()['n']
+            cur.execute("SELECT count(*)::bigint n FROM interfaces"); r['interfaces']=cur.fetchone()['n']
+            cur.execute("SELECT count(DISTINCT src_addr)::bigint n FROM flow_agg_src_1m WHERE bucket>=now()-(%s || ' hours')::interval",(h,)); r['sources']=cur.fetchone()['n']
+            cur.execute("SELECT count(DISTINCT dst_addr)::bigint n FROM flow_agg_dst_1m WHERE bucket>=now()-(%s || ' hours')::interval",(h,)); r['destinations']=cur.fetchone()['n']
+            cur.execute("SELECT pg_database_size(current_database())::bigint bytes"); r['database_bytes']=cur.fetchone()['bytes']
+            data=dict(r)
+
+        SUMMARY_CACHE.update({'ts':time.monotonic(),'hours':h,'data':data})
         return data
 
 
@@ -2015,10 +2037,10 @@ async def _run_exporter_delete_job(job_id: str, exporter: str):
         _job_update(job_id, status='done', stage='Completed', progress=100,
                     message='Exporter and all related data were deleted', result=result,
                     deleted_flows=result.get('deleted_flows', 0))
-        print(f"[v0.7.8] Exporter purge completed: {exporter}, {result.get('deleted_flows', 0)} flows removed.", flush=True)
+        print(f"[v0.7.11] Exporter purge completed: {exporter}, {result.get('deleted_flows', 0)} flows removed.", flush=True)
     except Exception as exc:
         _job_fail(job_id, exc)
-        print(f"[v0.7.8] Exporter purge failed for {exporter}: {getattr(exc, 'detail', exc)}", flush=True)
+        print(f"[v0.7.11] Exporter purge failed for {exporter}: {getattr(exc, 'detail', exc)}", flush=True)
 
 
 def _purge_exporter_with_progress(exporter: str, job_id: str):

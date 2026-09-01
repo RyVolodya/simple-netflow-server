@@ -1,3 +1,27 @@
+## v0.7.11
+
+- Reordered the top-right header controls.
+- `Logout` is now the rightmost icon button.
+- `Toggle theme` is immediately to the left of `Logout`.
+- No database, API, collector, spool, or retention changes.
+
+## v0.7.10
+
+- Moved live Spool usage from the global header to Settings → Storage.
+- Storage now shows current spool size and pending backlog (for example `18 MB / pending 0 MB`).
+- Spool state continues to refresh from `/api/system-status` every 5 seconds.
+- No database schema or spool processing changes.
+
+## v0.7.9
+
+- Added cached `/api/dashboard-summary` endpoint for all Dashboard cards.
+- Added 30-second configurable Dashboard summary TTL (`DASHBOARD_SUMMARY_CACHE_SECONDS`).
+- Added single-flight locking so concurrent cache misses cannot run duplicate `COUNT(DISTINCT src_addr/dst_addr)` scans.
+- Kept `/api/summary` as a compatibility alias.
+- Frontend Dashboard now uses `/api/dashboard-summary`.
+- Throttled SSE-triggered Dashboard card refresh requests to reduce Uvicorn/API request pressure during flow bursts.
+- No database reset or schema migration required.
+
 ## v0.7.8
 
 - Fixed the root cause of unbounded `flows.jsonl` growth under sustained NetFlow load.
