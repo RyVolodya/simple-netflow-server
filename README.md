@@ -20,15 +20,13 @@ conversations, and track exporters from a simple Docker-based
 application.
 
 </p>
-```
-```{=html}
+
 <p align="center">
-```
-`<a href="https://github.com/RyVolodya/simple-netflow-server">`{=html}GitHub
-Repository`</a>`{=html}
-```{=html}
+
+<a href="https://github.com/RyVolodya/simple-netflow-server">`}GitHub
+Repository`</a>
+
 </p>
-```
 
 ------------------------------------------------------------------------
 
