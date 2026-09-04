@@ -1,29 +1,24 @@
 <p align="center">
 <img src="docs/images/logo.svg" alt="Simple NetFlow Server logo" width="96" height="96">
 </p>
-```
-```{=html}
+
 <h1 align="center">
-```
 Simple NetFlow Server
-```{=html}
 </h1>
-```
-```{=html}
+
 <p align="center">
-```
-`<strong>`{=html}A lightweight NetFlow collector and traffic analyzer
-with a modern web interface.`</strong>`{=html}
-```{=html}
+
+A lightweight NetFlow collector and traffic analyzer
+with a modern web interface.`</strong>
+
 </p>
-```
-```{=html}
+
 <p align="center">
-```
+
 Monitor network traffic, analyze flows, discover top talkers, inspect
 conversations, and track exporters from a simple Docker-based
 application.
-```{=html}
+
 </p>
 ```
 ```{=html}
