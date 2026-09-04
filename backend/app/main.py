@@ -10,6 +10,7 @@ import signal
 import time
 import socket
 import threading
+import math
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
@@ -30,8 +31,8 @@ SPOOL_RESUME_MB = max(32, min(SPOOL_HARD_LIMIT_MB - 1, int(os.getenv("SPOOL_RESU
 COLLECTOR_PID = int(os.getenv("COLLECTOR_PID", "1"))
 DEFAULT_RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "30"))
 DEFAULT_RAW_RETENTION_HOURS = int(os.getenv("RAW_RETENTION_HOURS", "24"))
-DEFAULT_STATS_RETENTION_HOURS = int(os.getenv("STATS_RETENTION_HOURS", "720"))
-VERSION = os.getenv("APP_VERSION", "0.7.11")
+DEFAULT_STATS_RETENTION_DAYS = int(os.getenv("STATS_RETENTION_DAYS", "30"))
+VERSION = os.getenv("APP_VERSION", "0.8.7")
 DEFAULT_ADMIN_USER = os.getenv("ADMIN_USERNAME", "admin")
 DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "netflow")
 SESSION_HOURS = int(os.getenv("SESSION_HOURS", "24"))
@@ -212,6 +213,25 @@ CREATE INDEX IF NOT EXISTS idx_conv5m_dst_bucket ON flow_conversations_5m(dst_ad
 CREATE INDEX IF NOT EXISTS idx_conv5m_exporter_bucket_if ON flow_conversations_5m(exporter, bucket_start DESC, in_if, out_if);
 CREATE INDEX IF NOT EXISTS idx_conv5m_service_bucket ON flow_conversations_5m(proto, service_port, bucket_start DESC);
 
+CREATE TABLE IF NOT EXISTS flow_stats_conversations_5m (
+  bucket_start TIMESTAMPTZ NOT NULL,
+  exporter INET NOT NULL,
+  src_addr INET NOT NULL,
+  dst_addr INET NOT NULL,
+  proto INTEGER NOT NULL,
+  service_port INTEGER NOT NULL DEFAULT 0,
+  service_side TEXT NOT NULL DEFAULT '',
+  in_if INTEGER NOT NULL DEFAULT 0,
+  out_if INTEGER NOT NULL DEFAULT 0,
+  bytes BIGINT NOT NULL DEFAULT 0,
+  packets BIGINT NOT NULL DEFAULT 0,
+  flows BIGINT NOT NULL DEFAULT 0,
+  PRIMARY KEY(bucket_start, exporter, src_addr, dst_addr, proto, service_port, service_side, in_if, out_if)
+);
+CREATE INDEX IF NOT EXISTS idx_stats_conv5m_src_bucket ON flow_stats_conversations_5m(src_addr,bucket_start DESC);
+CREATE INDEX IF NOT EXISTS idx_stats_conv5m_dst_bucket ON flow_stats_conversations_5m(dst_addr,bucket_start DESC);
+CREATE INDEX IF NOT EXISTS idx_stats_conv5m_exporter_bucket ON flow_stats_conversations_5m(exporter,bucket_start DESC);
+
 CREATE TABLE IF NOT EXISTS users (
   id BIGSERIAL PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('administrator','user')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(), enabled BOOLEAN NOT NULL DEFAULT true,
@@ -313,7 +333,7 @@ def ensure_partitioned_flows():
                 cur.execute(f"CREATE INDEX {name} ON flows ({cols})")
             c.commit(); return
 
-        print('[v0.7.11] Migrating raw flows to daily partitions. This is a one-time operation...', flush=True)
+        print('[v0.8.2] Migrating raw flows to daily partitions. This is a one-time operation...', flush=True)
         cur.execute("SELECT count(*)::bigint n,min(received_at) mn,max(received_at) mx FROM flows")
         meta=cur.fetchone(); old_count=int(meta['n'])
         cur.execute("ALTER TABLE flows RENAME TO flows_legacy_052")
@@ -338,7 +358,7 @@ def ensure_partitioned_flows():
         for name,cols in OPTIMIZED_FLOW_INDEXES:
             cur.execute(f"CREATE INDEX {name} ON flows ({cols})")
         c.commit()
-        print(f'[v0.7.11] Partition migration complete: {new_count} flows preserved.', flush=True)
+        print(f'[v0.8.2] Partition migration complete: {new_count} flows preserved.', flush=True)
 
 
 def drop_expired_flow_partitions(cur, raw_hours):
@@ -358,7 +378,7 @@ def drop_expired_flow_partitions(cur, raw_hours):
 
 
 def storage_breakdown():
-    agg_tables=['flow_agg_total_1m','flow_agg_src_1m','flow_agg_dst_1m','flow_agg_exporter_1m','flow_agg_app_1m','flow_agg_interface_1m']
+    agg_tables=['flow_agg_total_1m','flow_agg_src_1m','flow_agg_dst_1m','flow_agg_exporter_1m','flow_agg_app_1m','flow_agg_interface_1m','flow_stats_conversations_5m']
     with conn() as c,c.cursor() as cur:
         cur.execute("""SELECT pg_relation_size('flow_conversations_5m')::bigint raw_data,
                               pg_indexes_size('flow_conversations_5m')::bigint raw_indexes,
@@ -612,6 +632,7 @@ def insert_flow_batch(rows, offset_key=None, end_offset=None):
     appagg = defaultdict(lambda: [0,0,0])
     iface = defaultdict(lambda: [0,0,0])
     conversations={}
+    historical_conversations=defaultdict(lambda:[0,0,0])
     exporters_seen=set()
 
     for r in rows:
@@ -632,6 +653,9 @@ def insert_flow_batch(rows, offset_key=None, end_offset=None):
             a=appagg[(b1,proto,int(port))]; a[0]+=vals[0]; a[1]+=vals[1]; a[2]+=1
 
         b5=_bucket_5m(r['received_at']); conv_key, service_port, service_side = _conversation_key(r); key=(b5,conv_key)
+        if r.get('exporter') and r.get('src_addr') and r.get('dst_addr') and r.get('proto') is not None:
+            hk=(b5,r['exporter'],r['src_addr'],r['dst_addr'],int(r['proto']),int(service_port or 0),service_side or '',int(r.get('in_if') or 0),int(r.get('out_if') or 0))
+            hv=historical_conversations[hk]; hv[0]+=r['bytes']; hv[1]+=r['packets']; hv[2]+=1
         c=conversations.get(key)
         if c is None:
             c=dict(r)
@@ -670,6 +694,12 @@ def insert_flow_batch(rows, offset_key=None, end_offset=None):
               sampling_rate=COALESCE(excluded.sampling_rate,flow_conversations_5m.sampling_rate),
               tcp_flags=COALESCE(excluded.tcp_flags,flow_conversations_5m.tcp_flags),
               flow_type=COALESCE(excluded.flow_type,flow_conversations_5m.flow_type)""", vals)
+        if historical_conversations:
+            hvals=[(*k,*v) for k,v in historical_conversations.items()]
+            cur.executemany("""INSERT INTO flow_stats_conversations_5m(bucket_start,exporter,src_addr,dst_addr,proto,service_port,service_side,in_if,out_if,bytes,packets,flows)
+              VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+              ON CONFLICT(bucket_start,exporter,src_addr,dst_addr,proto,service_port,service_side,in_if,out_if) DO UPDATE SET
+              bytes=flow_stats_conversations_5m.bytes+excluded.bytes,packets=flow_stats_conversations_5m.packets+excluded.packets,flows=flow_stats_conversations_5m.flows+excluded.flows""",hvals)
         if exporters_seen:
             cur.executemany("""INSERT INTO exporters(ip,first_seen,last_seen) VALUES(%s::inet,now(),now())
                                ON CONFLICT(ip) DO UPDATE SET last_seen=excluded.last_seen""",[(x,) for x in exporters_seen])
@@ -853,9 +883,9 @@ async def _recover_rotated_spool():
             final_pos=await asyncio.to_thread(_ingest_file_tail, rotated, offset, "flow_spool_rotation_offset")
             os.unlink(rotated)
         await asyncio.to_thread(_set_spool_state, 0, "", 0)
-        print(f"[v0.7.11] recovered spool rotation: {rotated}", flush=True)
+        print(f"[v0.8.2] recovered spool rotation: {rotated}", flush=True)
     except Exception as e:
-        print(f"[v0.7.11] spool rotation recovery error: {e}", flush=True)
+        print(f"[v0.8.2] spool rotation recovery error: {e}", flush=True)
         raise
 
 
@@ -908,7 +938,7 @@ async def _rotate_consumed_spool(path, pos):
     if os.path.exists(rotated):
         os.unlink(rotated)
     await asyncio.to_thread(_set_spool_state, 0, "", 0)
-    print(f"[v0.7.11] spool rotated and compacted: freed {final_pos} bytes", flush=True)
+    print(f"[v0.8.2] spool rotated and compacted: freed {final_pos} bytes", flush=True)
     return 0, True
 
 
@@ -961,7 +991,7 @@ async def spool_ingester():
                 # Active file generation changed (manual truncate, completed
                 # rotation or crash recovery).  The old committed prefix no
                 # longer exists, so start at byte 0 of the new generation.
-                print(f"[v0.7.11] spool offset mismatch recovered: offset={pos} size={size}; resetting to 0", flush=True)
+                print(f"[v0.8.2] spool offset mismatch recovered: offset={pos} size={size}; resetting to 0", flush=True)
                 pos=0
                 batch=[]
                 await asyncio.to_thread(_set_spool_state, 0, "", 0)
@@ -994,7 +1024,7 @@ async def spool_ingester():
                 batch=[]
                 last_flush=asyncio.get_running_loop().time()
         except Exception as e:
-            print(f"[v0.7.11] spool ingest error: {e}", flush=True)
+            print(f"[v0.8.2] spool ingest error: {e}", flush=True)
             await asyncio.sleep(1.0)
             continue
 
@@ -1015,7 +1045,7 @@ async def retention_worker():
     while True:
         try:
             detailed_hours=max(1,int(get_setting('raw_retention_hours', DEFAULT_RAW_RETENTION_HOURS)))
-            stats_hours=max(6,int(get_setting('stats_retention_hours', DEFAULT_STATS_RETENTION_HOURS)))
+            stats_days=max(1,int(get_setting('stats_retention_days', DEFAULT_STATS_RETENTION_DAYS)))
             with conn() as c,c.cursor() as cur:
                 cur.execute("DELETE FROM flow_conversations_5m WHERE last_seen < now() - (%s || ' hours')::interval",(detailed_hours,))
                 # v0.7 no longer writes legacy raw rows. If upgrading in place,
@@ -1023,13 +1053,14 @@ async def retention_worker():
                 cur.execute("SELECT to_regclass('public.flows') AS reg")
                 if cur.fetchone()['reg'] is not None:
                     try: drop_expired_flow_partitions(cur,detailed_hours)
-                    except Exception as e: print(f'[v0.7.11] legacy raw cleanup warning: {e}',flush=True)
+                    except Exception as e: print(f'[v0.8.2] legacy raw cleanup warning: {e}',flush=True)
                 for table in ['flow_agg_total_1m','flow_agg_src_1m','flow_agg_dst_1m','flow_agg_exporter_1m','flow_agg_app_1m','flow_agg_interface_1m']:
-                    cur.execute(f"DELETE FROM {table} WHERE bucket < now() - (%s || ' hours')::interval",(stats_hours,))
+                    cur.execute(f"DELETE FROM {table} WHERE bucket < now() - (%s || ' days')::interval",(stats_days,))
+                cur.execute("DELETE FROM flow_stats_conversations_5m WHERE bucket_start < now() - (%s || ' days')::interval",(stats_days,))
                 cur.execute('DELETE FROM sessions WHERE expires_at < now()')
                 SUMMARY_CACHE['data']=None
         except Exception as e:
-            print(f'[v0.7.11] retention error: {e}',flush=True)
+            print(f'[v0.8.2] retention error: {e}',flush=True)
         await asyncio.sleep(3600)
 
 
@@ -1069,7 +1100,7 @@ def rebuild_aggregates(force=False):
             cur.execute('TRUNCATE flow_agg_total_1m,flow_agg_src_1m,flow_agg_dst_1m,flow_agg_exporter_1m,flow_agg_app_1m,flow_agg_interface_1m')
         cur.execute('SELECT EXISTS(SELECT 1 FROM flow_conversations_5m) has')
         if not cur.fetchone()['has']: c.commit(); return
-        print('[v0.7.11] rebuilding dashboard aggregates from 5-minute conversations...',flush=True)
+        print('[v0.8.2] rebuilding dashboard aggregates from 5-minute conversations...',flush=True)
         cur.execute("""INSERT INTO flow_agg_total_1m(bucket,bytes,packets,flows)
           SELECT date_trunc('minute',last_seen),sum(bytes),sum(packets),sum(flow_count) FROM flow_conversations_5m GROUP BY 1""")
         cur.execute("""INSERT INTO flow_agg_src_1m(bucket,src_addr,bytes,packets,flows)
@@ -1112,7 +1143,19 @@ def bootstrap_metadata():
         # v0.6.3 defaults for fresh installations. Existing installations keep
         # their saved values because ON CONFLICT does not overwrite them.
         cur.execute("INSERT INTO app_settings(key,value) VALUES('raw_retention_hours',%s) ON CONFLICT(key) DO NOTHING", (str(DEFAULT_RAW_RETENTION_HOURS),))
-        cur.execute("INSERT INTO app_settings(key,value) VALUES('stats_retention_hours',%s) ON CONFLICT(key) DO NOTHING", (str(DEFAULT_STATS_RETENTION_HOURS),))
+        cur.execute("SELECT value FROM app_settings WHERE key='raw_retention_hours'"); rr=cur.fetchone(); raw_saved=int(rr['value']) if rr else DEFAULT_RAW_RETENTION_HOURS
+        if raw_saved not in (1,3,6,12,24):
+            raw_saved=min((1,3,6,12,24),key=lambda x:abs(x-raw_saved)); cur.execute("UPDATE app_settings SET value=%s,updated_at=now() WHERE key='raw_retention_hours'",(str(raw_saved),))
+        cur.execute("SELECT value FROM app_settings WHERE key='stats_retention_hours'")
+        old_stats=cur.fetchone()
+        migrated_stats_days=max(1,math.ceil(int(old_stats['value'])/24)) if old_stats else DEFAULT_STATS_RETENTION_DAYS
+        cur.execute("INSERT INTO app_settings(key,value) VALUES('stats_retention_days',%s) ON CONFLICT(key) DO NOTHING",(str(migrated_stats_days),))
+        cur.execute("SELECT 1 FROM flow_stats_conversations_5m LIMIT 1")
+        if not cur.fetchone():
+            cur.execute("""INSERT INTO flow_stats_conversations_5m(bucket_start,exporter,src_addr,dst_addr,proto,service_port,service_side,in_if,out_if,bytes,packets,flows)
+              SELECT bucket_start,exporter,src_addr,dst_addr,proto,coalesce(service_port,0),coalesce(service_side,''),coalesce(in_if,0),coalesce(out_if,0),sum(bytes),sum(packets),sum(flow_count)
+              FROM flow_conversations_5m WHERE exporter IS NOT NULL AND src_addr IS NOT NULL AND dst_addr IS NOT NULL AND proto IS NOT NULL
+              GROUP BY bucket_start,exporter,src_addr,dst_addr,proto,coalesce(service_port,0),coalesce(service_side,''),coalesce(in_if,0),coalesce(out_if,0) ON CONFLICT DO NOTHING""")
         cur.execute("SELECT 1 FROM users LIMIT 1")
         if not cur.fetchone():
             cur.execute("INSERT INTO users(username,password_hash,role,must_change_password) VALUES(%s,%s,'administrator',true)", (DEFAULT_ADMIN_USER, hash_password(DEFAULT_ADMIN_PASSWORD)))
@@ -1132,10 +1175,10 @@ async def lifespan(app: FastAPI):
             break
         except Exception as e:
             last_error=e
-            print(f'[v0.7.11] startup attempt {attempt+1}/30 failed: {e}', flush=True)
+            print(f'[v0.8.2] startup attempt {attempt+1}/30 failed: {e}', flush=True)
             await asyncio.sleep(1)
     if not initialized:
-        raise RuntimeError(f'v0.7.11 storage initialization failed: {last_error}')
+        raise RuntimeError(f'v0.8.2 storage initialization failed: {last_error}')
     t1 = asyncio.create_task(spool_ingester())
     t2 = asyncio.create_task(retention_worker())
     yield
@@ -1909,6 +1952,81 @@ def conversations_count(
         return cur.fetchone()
 
 
+
+def build_stats_filter(date_from=None,date_to=None,exporter=None,q=None,src=None,dst=None,src_port=None,dst_port=None,port=None,proto=None,interface_exporter=None,interface_index=None,in_if=None,out_if=None):
+    clauses=[]; params=[]
+    if date_from: clauses.append('f.bucket_start >= %s'); params.append(date_from)
+    if date_to: clauses.append("f.bucket_start < %s + interval '5 minutes'"); params.append(date_to)
+    if q:
+        v=f"%{q}%"; clauses.append('(host(f.src_addr) ILIKE %s OR host(f.dst_addr) ILIKE %s OR host(f.exporter) ILIKE %s OR f.service_port::text ILIKE %s)'); params += [v,v,v,v]
+    if exporter: clauses.append('f.exporter=%s::inet'); params.append(normalize_host(exporter))
+    if src:
+        try: v=normalize_host(src); ipaddress.ip_address(v); clauses.append('f.src_addr=%s::inet'); params.append(v)
+        except Exception: clauses.append('host(f.src_addr) ILIKE %s'); params.append(f"%{src}%")
+    if dst:
+        try: v=normalize_host(dst); ipaddress.ip_address(v); clauses.append('f.dst_addr=%s::inet'); params.append(v)
+        except Exception: clauses.append('host(f.dst_addr) ILIKE %s'); params.append(f"%{dst}%")
+    if src_port is not None: clauses.append("f.service_side='source' AND f.service_port=%s"); params.append(src_port)
+    if dst_port is not None: clauses.append("f.service_side='destination' AND f.service_port=%s"); params.append(dst_port)
+    if port is not None: clauses.append('f.service_port=%s'); params.append(port)
+    if proto is not None: clauses.append('f.proto=%s'); params.append(proto)
+    if interface_index is not None:
+        clauses.append('(f.in_if=%s OR f.out_if=%s)'); params += [interface_index,interface_index]
+        if interface_exporter: clauses.append('f.exporter=%s::inet'); params.append(normalize_host(interface_exporter))
+    if in_if is not None: clauses.append('f.in_if=%s'); params.append(in_if)
+    if out_if is not None: clauses.append('f.out_if=%s'); params.append(out_if)
+    return (' AND '.join(clauses) if clauses else 'TRUE'),params
+
+@app.get('/api/statistics/flows')
+def statistics_flows(limit:int=10,offset:int=0,q:Optional[str]=None,date_from:Optional[datetime]=None,date_to:Optional[datetime]=None,exporter:Optional[str]=None,src:Optional[str]=None,dst:Optional[str]=None,src_port:Optional[int]=None,dst_port:Optional[int]=None,port:Optional[int]=None,proto:Optional[int]=None,interface_exporter:Optional[str]=None,interface_index:Optional[int]=None,sort:Optional[str]=None,order:Optional[str]=None):
+    where,params=build_stats_filter(date_from,date_to,exporter,q,src,dst,src_port,dst_port,port,proto,interface_exporter,interface_index)
+    sort_map={'received_at':'f.bucket_start','exporter':'COALESCE(e.hostname,host(f.exporter))','src':'f.src_addr','dst':'f.dst_addr','proto':'f.proto','in_if':'f.in_if','out_if':'f.out_if','bytes':'f.bytes','packets':'f.packets'}
+    sort_col=sort_map.get(sort or 'received_at','f.bucket_start'); sort_dir='ASC' if str(order).lower()=='asc' else 'DESC'
+    params += [min(max(limit,1),100),max(offset,0)]
+    with conn() as c,c.cursor() as cur:
+        cur.execute(f"""SELECT NULL::bigint id,f.bucket_start received_at,f.bucket_start first_seen,f.bucket_start+interval '5 minutes' last_seen,f.flows flow_count,host(f.exporter) exporter,e.hostname exporter_hostname,'statistics' flow_type,host(f.src_addr) src_addr,host(f.dst_addr) dst_addr,NULL::integer src_port,NULL::integer dst_port,f.proto,f.bytes,f.packets,NULLIF(f.in_if,0) in_if,NULLIF(f.out_if,0) out_if,NULLIF(f.service_port,0) service_port,NULLIF(f.service_side,'') service_side,CASE WHEN nullif(ii.if_alias,'') IS NOT NULL THEN coalesce(nullif(ii.if_name,''),nullif(ii.if_descr,''),'ifIndex '||NULLIF(f.in_if,0)::text)||' ('||ii.if_alias||')' ELSE COALESCE(NULLIF(ii.if_name,''),NULLIF(ii.if_descr,'')) END in_if_name,CASE WHEN nullif(oi.if_alias,'') IS NOT NULL THEN coalesce(nullif(oi.if_name,''),nullif(oi.if_descr,''),'ifIndex '||NULLIF(f.out_if,0)::text)||' ('||oi.if_alias||')' ELSE COALESCE(NULLIF(oi.if_name,''),NULLIF(oi.if_descr,'')) END out_if_name FROM flow_stats_conversations_5m f LEFT JOIN exporters e ON e.ip=f.exporter LEFT JOIN interfaces ii ON ii.exporter=f.exporter AND ii.if_index=NULLIF(f.in_if,0) LEFT JOIN interfaces oi ON oi.exporter=f.exporter AND oi.if_index=NULLIF(f.out_if,0) WHERE {where} ORDER BY {sort_col} {sort_dir},f.bytes DESC LIMIT %s OFFSET %s""",params)
+        return cur.fetchall()
+
+@app.get('/api/statistics/flows/count')
+def statistics_flows_count(q:Optional[str]=None,date_from:Optional[datetime]=None,date_to:Optional[datetime]=None,exporter:Optional[str]=None,src:Optional[str]=None,dst:Optional[str]=None,src_port:Optional[int]=None,dst_port:Optional[int]=None,port:Optional[int]=None,proto:Optional[int]=None,interface_exporter:Optional[str]=None,interface_index:Optional[int]=None):
+    where,params=build_stats_filter(date_from,date_to,exporter,q,src,dst,src_port,dst_port,port,proto,interface_exporter,interface_index)
+    with conn() as c,c.cursor() as cur:
+        cur.execute(f'SELECT count(*)::bigint total FROM flow_stats_conversations_5m f WHERE {where}',params); return cur.fetchone()
+
+@app.get('/api/statistics/flows/summary')
+def statistics_flows_summary(limit:int=10,offset:int=0,q:Optional[str]=None,date_from:Optional[datetime]=None,date_to:Optional[datetime]=None,exporter:Optional[str]=None,src:Optional[str]=None,dst:Optional[str]=None,src_port:Optional[int]=None,dst_port:Optional[int]=None,port:Optional[int]=None,proto:Optional[int]=None,interface_exporter:Optional[str]=None,interface_index:Optional[int]=None,sort:Optional[str]=None,order:Optional[str]=None):
+    where,params=build_stats_filter(date_from,date_to,exporter,q,src,dst,src_port,dst_port,port,proto,interface_exporter,interface_index)
+    if src and not dst: mode='source'; select="host(f.dst_addr) peer_addr,NULL::text src_addr,host(f.dst_addr) dst_addr,f.proto,NULLIF(f.service_port,0) port"; group='f.dst_addr,f.proto,f.service_port'
+    elif dst and not src: mode='destination'; select="host(f.src_addr) peer_addr,host(f.src_addr) src_addr,NULL::text dst_addr,f.proto,NULLIF(f.service_port,0) port"; group='f.src_addr,f.proto,f.service_port'
+    else: mode='pair'; select="NULL::text peer_addr,host(f.src_addr) src_addr,host(f.dst_addr) dst_addr,f.proto,NULLIF(f.service_port,0) port"; group='f.src_addr,f.dst_addr,f.proto,f.service_port'
+    sort_map={'src':'src_addr','dst':'dst_addr','peer':'peer_addr','proto':'proto','port':'port','bytes':'bytes','packets':'packets','flows':'flows'}; sort_col=sort_map.get(sort or 'bytes','bytes'); sort_dir='ASC' if str(order).lower()=='asc' else 'DESC'
+    params += [min(max(limit,1),100),max(offset,0)]
+    with conn() as c,c.cursor() as cur:
+        cur.execute(f"SELECT {select},sum(f.bytes)::bigint bytes,sum(f.packets)::bigint packets,sum(f.flows)::bigint flows,max(f.bucket_start+interval '5 minutes') last_seen FROM flow_stats_conversations_5m f WHERE {where} GROUP BY {group} ORDER BY {sort_col} {sort_dir} NULLS LAST LIMIT %s OFFSET %s",params); return {'mode':mode,'rows':cur.fetchall()}
+
+@app.get('/api/statistics/flows/summary/count')
+def statistics_flows_summary_count(q:Optional[str]=None,date_from:Optional[datetime]=None,date_to:Optional[datetime]=None,exporter:Optional[str]=None,src:Optional[str]=None,dst:Optional[str]=None,src_port:Optional[int]=None,dst_port:Optional[int]=None,port:Optional[int]=None,proto:Optional[int]=None,interface_exporter:Optional[str]=None,interface_index:Optional[int]=None):
+    where,params=build_stats_filter(date_from,date_to,exporter,q,src,dst,src_port,dst_port,port,proto,interface_exporter,interface_index)
+    if src and not dst: mode='source'; group='f.dst_addr,f.proto,f.service_port'
+    elif dst and not src: mode='destination'; group='f.src_addr,f.proto,f.service_port'
+    else: mode='pair'; group='f.src_addr,f.dst_addr,f.proto,f.service_port'
+    with conn() as c,c.cursor() as cur:
+        cur.execute(f'SELECT count(*)::bigint total FROM (SELECT 1 FROM flow_stats_conversations_5m f WHERE {where} GROUP BY {group}) x',params); return {'mode':mode,'total':cur.fetchone()['total']}
+
+@app.get('/api/statistics/conversations')
+def statistics_conversations(limit:int=10,offset:int=0,q:Optional[str]=None,date_from:Optional[datetime]=None,date_to:Optional[datetime]=None,exporter:Optional[str]=None,src:Optional[str]=None,dst:Optional[str]=None,src_port:Optional[int]=None,dst_port:Optional[int]=None,port:Optional[int]=None,proto:Optional[int]=None,group_by:str=Query('ip',pattern='^(ip|interface)$'),in_if:Optional[int]=None,out_if:Optional[int]=None):
+    where,params=build_stats_filter(date_from,date_to,exporter,q,src,dst,src_port,dst_port,port,proto,in_if=in_if,out_if=out_if); params += [min(max(limit,1),100),max(offset,0)]
+    with conn() as c,c.cursor() as cur:
+        if group_by=='interface':
+            cur.execute(f"""SELECT host(f.exporter) exporter,NULLIF(f.in_if,0) in_if,NULLIF(f.out_if,0) out_if,CASE WHEN nullif(ii.if_alias,'') IS NOT NULL THEN coalesce(nullif(ii.if_name,''),nullif(ii.if_descr,''),'ifIndex '||NULLIF(f.in_if,0)::text)||' ('||ii.if_alias||')' ELSE coalesce(nullif(ii.if_name,''),nullif(ii.if_descr,''),'ifIndex '||NULLIF(f.in_if,0)::text) END in_if_name,CASE WHEN nullif(oi.if_alias,'') IS NOT NULL THEN coalesce(nullif(oi.if_name,''),nullif(oi.if_descr,''),'ifIndex '||NULLIF(f.out_if,0)::text)||' ('||oi.if_alias||')' ELSE coalesce(nullif(oi.if_name,''),nullif(oi.if_descr,''),'ifIndex '||NULLIF(f.out_if,0)::text) END out_if_name,coalesce(nullif(e.hostname,''),host(f.exporter)) device_name,sum(f.bytes)::bigint bytes,sum(f.packets)::bigint packets,sum(f.flows)::bigint flows,max(f.bucket_start+interval '5 minutes') last_seen FROM flow_stats_conversations_5m f LEFT JOIN exporters e ON e.ip=f.exporter LEFT JOIN interfaces ii ON ii.exporter=f.exporter AND ii.if_index=NULLIF(f.in_if,0) LEFT JOIN interfaces oi ON oi.exporter=f.exporter AND oi.if_index=NULLIF(f.out_if,0) WHERE {where} GROUP BY f.exporter,f.in_if,f.out_if,ii.if_name,ii.if_descr,ii.if_alias,oi.if_name,oi.if_descr,oi.if_alias,e.hostname ORDER BY bytes DESC LIMIT %s OFFSET %s""",params); return cur.fetchall()
+        cur.execute(f"SELECT host(f.src_addr) src_addr,host(f.dst_addr) dst_addr,sum(f.bytes)::bigint bytes,sum(f.packets)::bigint packets,sum(f.flows)::bigint flows,min(f.bucket_start) first_seen,max(f.bucket_start+interval '5 minutes') last_seen FROM flow_stats_conversations_5m f WHERE {where} GROUP BY f.src_addr,f.dst_addr ORDER BY bytes DESC,f.src_addr,f.dst_addr LIMIT %s OFFSET %s",params); return cur.fetchall()
+
+@app.get('/api/statistics/conversations/count')
+def statistics_conversations_count(q:Optional[str]=None,date_from:Optional[datetime]=None,date_to:Optional[datetime]=None,exporter:Optional[str]=None,src:Optional[str]=None,dst:Optional[str]=None,src_port:Optional[int]=None,dst_port:Optional[int]=None,port:Optional[int]=None,proto:Optional[int]=None,group_by:str=Query('ip',pattern='^(ip|interface)$'),in_if:Optional[int]=None,out_if:Optional[int]=None):
+    where,params=build_stats_filter(date_from,date_to,exporter,q,src,dst,src_port,dst_port,port,proto,in_if=in_if,out_if=out_if); group='f.exporter,f.in_if,f.out_if' if group_by=='interface' else 'f.src_addr,f.dst_addr'
+    with conn() as c,c.cursor() as cur:
+        cur.execute(f'SELECT count(*)::bigint total FROM (SELECT 1 FROM flow_stats_conversations_5m f WHERE {where} GROUP BY {group}) x',params); return cur.fetchone()
+
 @app.get("/api/flows/series")
 def flows_series(
     q: Optional[str] = None,
@@ -2037,10 +2155,10 @@ async def _run_exporter_delete_job(job_id: str, exporter: str):
         _job_update(job_id, status='done', stage='Completed', progress=100,
                     message='Exporter and all related data were deleted', result=result,
                     deleted_flows=result.get('deleted_flows', 0))
-        print(f"[v0.7.11] Exporter purge completed: {exporter}, {result.get('deleted_flows', 0)} flows removed.", flush=True)
+        print(f"[v0.8.2] Exporter purge completed: {exporter}, {result.get('deleted_flows', 0)} flows removed.", flush=True)
     except Exception as exc:
         _job_fail(job_id, exc)
-        print(f"[v0.7.11] Exporter purge failed for {exporter}: {getattr(exc, 'detail', exc)}", flush=True)
+        print(f"[v0.8.2] Exporter purge failed for {exporter}: {getattr(exc, 'detail', exc)}", flush=True)
 
 
 def _purge_exporter_with_progress(exporter: str, job_id: str):
@@ -2053,6 +2171,7 @@ def _purge_exporter_with_progress(exporter: str, job_id: str):
         cur.execute('SELECT count(*)::bigint rows,coalesce(sum(flow_count),0)::bigint flows FROM flow_conversations_5m WHERE exporter=%s::inet',(exporter,)); meta=cur.fetchone()
         _job_update(job_id,stage='Deleting conversations',progress=20,message=f"Deleting {int(meta['rows'] or 0):,} aggregated conversation rows")
         cur.execute('DELETE FROM flow_conversations_5m WHERE exporter=%s::inet',(exporter,)); deleted_rows=cur.rowcount
+        cur.execute('DELETE FROM flow_stats_conversations_5m WHERE exporter=%s::inet',(exporter,)); deleted_stats_rows=cur.rowcount
         # Clean legacy raw rows only on upgrades where the old table still exists.
         cur.execute("SELECT to_regclass('public.flows') AS reg")
         if cur.fetchone()['reg'] is not None:
@@ -2065,7 +2184,7 @@ def _purge_exporter_with_progress(exporter: str, job_id: str):
         cur.execute('DELETE FROM exporters WHERE ip=%s::inet',(exporter,))
         c.commit()
     SUMMARY_CACHE['data']=None
-    return {'deleted_flows':int(meta['flows'] or 0),'deleted_conversation_rows':deleted_rows,'deleted_interfaces':deleted_interfaces,'deleted_exporter_aggregate_rows':deleted_exporter_agg,'deleted_interface_aggregate_rows':deleted_interface_agg}
+    return {'deleted_flows':int(meta['flows'] or 0),'deleted_conversation_rows':deleted_rows,'deleted_statistics_rows':deleted_stats_rows,'deleted_interfaces':deleted_interfaces,'deleted_exporter_aggregate_rows':deleted_exporter_agg,'deleted_interface_aggregate_rows':deleted_interface_agg}
 
 
 @app.get("/api/service-labels")
@@ -2156,69 +2275,21 @@ def delete_port_description(item_id: int):
 
 @app.get("/api/settings")
 def settings():
-    old=int(get_setting('retention_hours', int(get_setting('retention_days', DEFAULT_RETENTION_DAYS))*24))
-    raw=max(1,int(get_setting('raw_retention_hours', DEFAULT_RAW_RETENTION_HOURS)))
-    stats=max(6,int(get_setting('stats_retention_hours', DEFAULT_STATS_RETENTION_HOURS)))
-    return {"raw_retention_days":raw//24,"raw_retention_hours":raw%24,"raw_retention_total_hours":raw,
-            "stats_retention_days":stats//24,"stats_retention_hours":stats%24,"stats_retention_total_hours":stats,
-            **storage_breakdown()}
-
-
-def _retention_int(payload: dict, *names: str, default=None) -> int:
-    value = default
-    for name in names:
-        if name in payload and payload[name] not in (None, ""):
-            value = payload[name]
-            break
-    if value is None:
-        raise HTTPException(422, f"Missing retention field: {names[0]}")
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        raise HTTPException(422, f"Invalid retention value for {names[0]}")
-
+    raw=int(get_setting('raw_retention_hours',DEFAULT_RAW_RETENTION_HOURS))
+    if raw not in (1,3,6,12,24): raw=min((1,3,6,12,24),key=lambda x:abs(x-raw))
+    stats_days=max(1,int(get_setting('stats_retention_days',DEFAULT_STATS_RETENTION_DAYS)))
+    return {"raw_retention_total_hours":raw,"stats_retention_days":stats_days,**storage_breakdown()}
 
 @app.put("/api/settings/retention")
 async def update_retention(request: Request):
-    # Parse the JSON explicitly instead of relying on a strict Pydantic request
-    # model. This keeps the endpoint compatible with the 0.5.x frontends and
-    # produces a useful error string rather than a list of validation objects.
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(400, "Invalid JSON request body")
-    if not isinstance(payload, dict):
-        raise HTTPException(422, "Retention settings must be a JSON object")
-
-    # Current names plus compatibility aliases used by earlier 0.5.x builds.
-    raw_days = _retention_int(payload, "raw_days", "raw_retention_days", default=0)
-    raw_hours = _retention_int(payload, "raw_hours", "raw_retention_hours", default=0)
-    stats_days = _retention_int(payload, "stats_days", "stats_retention_days", default=0)
-    stats_hours = _retention_int(payload, "stats_hours", "stats_retention_hours", default=0)
-
-    if not 0 <= raw_days <= 3650 or not 0 <= stats_days <= 3650:
-        raise HTTPException(422, "Retention days must be between 0 and 3650")
-    if not 0 <= raw_hours <= 23 or not 0 <= stats_hours <= 23:
-        raise HTTPException(422, "Retention hours must be between 0 and 23")
-
-    raw = raw_days * 24 + raw_hours
-    stats = stats_days * 24 + stats_hours
-    if raw < 1:
-        raise HTTPException(422, "Detailed conversations retention must be at least 1 hour")
-    if stats < 6:
-        raise HTTPException(422, "Statistics retention must be at least 6 hours")
-
-    set_setting("raw_retention_hours", raw)
-    set_setting("stats_retention_hours", stats)
-    return {
-        "status": "ok",
-        "raw_retention_days": raw // 24,
-        "raw_retention_hours": raw % 24,
-        "raw_retention_total_hours": raw,
-        "stats_retention_days": stats // 24,
-        "stats_retention_hours": stats % 24,
-        "stats_retention_total_hours": stats,
-    }
+    try: payload=await request.json()
+    except Exception: raise HTTPException(400,"Invalid JSON request body")
+    try: raw=int(payload.get('raw_hours')); stats_days=int(payload.get('stats_days'))
+    except Exception: raise HTTPException(422,"Invalid retention values")
+    if raw not in (1,3,6,12,24): raise HTTPException(422,"Detailed conversations retention must be 1, 3, 6, 12 or 24 hours")
+    if not 1 <= stats_days <= 3650: raise HTTPException(422,"Statistics retention must be between 1 and 3650 days")
+    set_setting('raw_retention_hours',raw); set_setting('stats_retention_days',stats_days)
+    return {"status":"ok","raw_retention_total_hours":raw,"stats_retention_days":stats_days}
 
 
 @app.get("/api/exporters/{exporter}")
