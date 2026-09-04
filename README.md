@@ -1,7 +1,5 @@
 <p align="center">
-
-<img src="docs/images/logo.svg" alt="Simple NetFlow Server logo" width="96" height="96">`{=html}
-{=html}
+<img src="docs/images/logo.svg" alt="Simple NetFlow Server logo" width="96" height="96">
 </p>
 ```
 ```{=html}
