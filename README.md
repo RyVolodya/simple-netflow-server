@@ -1,31 +1,19 @@
 <p align="center">
-<img src="docs/images/logo.svg" alt="Simple NetFlow Server logo" width="96" height="96">
+  <img src="docs/images/logo.svg" alt="Simple NetFlow Server logo" width="96" height="96">
 </p>
 
-<h1 align="center">
-Simple NetFlow Server
-</h1>
+<h1 align="center">Simple NetFlow Server</h1>
 
 <p align="center">
-
-A lightweight NetFlow collector and traffic analyzer
-with a modern web interface.`</strong>
-
+  <strong>A lightweight NetFlow collector and traffic analyzer with a modern web interface.</strong>
 </p>
 
 <p align="center">
-
-Monitor network traffic, analyze flows, discover top talkers, inspect
-conversations, and track exporters from a simple Docker-based
-application.
-
+  Monitor network traffic, analyze flows, discover top talkers, inspect conversations, and track exporters from a simple Docker-based application.
 </p>
 
 <p align="center">
-
-<a href="https://github.com/RyVolodya/simple-netflow-server">`}GitHub
-Repository`</a>
-
+  <a href="https://github.com/RyVolodya/simple-netflow-server">GitHub Repository</a>
 </p>
 
 ------------------------------------------------------------------------
