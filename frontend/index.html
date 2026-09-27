@@ -38,19 +38,191 @@
   }
 }
 
-/* v0.8.7: desktop From / To controls use the same grid width as other filters. */
+/* v0.8.12: desktop From / To controls use the same grid width as other filters. */
 @media(min-width:561px){
   #flows .datetime-mobile-wrap,#conversation .datetime-mobile-wrap{width:100%;min-width:0;max-width:100%}
   #flows .datetime-mobile-wrap>.field,#conversation .datetime-mobile-wrap>.field{width:100%;min-width:0;max-width:100%;box-sizing:border-box}
 }
 
+
+
+/* v0.8.12: responsive safety + visual refresh. Layout/functionality stays unchanged. */
+:root{
+  --radius:12px;--radius-sm:9px;
+  --shadow:0 8px 28px rgba(15,23,42,.06);
+  --focus:0 0 0 3px color-mix(in srgb,var(--accent) 18%,transparent);
+}
+[data-theme="dark"]{--shadow:0 10px 32px rgba(0,0,0,.18)}
+html,body{max-width:100%;overflow-x:hidden}
+body{line-height:1.45;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+img,svg,canvas{max-width:100%}
+button,input,select,textarea{max-width:100%}
+button,.btn,.icon-btn,.field,.segmented button,.view-toggle button{transition:border-color .16s ease,background-color .16s ease,color .16s ease,box-shadow .16s ease,transform .16s ease}
+button:focus-visible,.btn:focus-visible,.icon-btn:focus-visible,.field:focus-visible,.link-btn:focus-visible{outline:none;box-shadow:var(--focus)}
+.btn:hover:not(:disabled),.icon-btn:hover:not(:disabled){border-color:color-mix(in srgb,var(--accent) 38%,var(--line));background:color-mix(in srgb,var(--accent) 7%,var(--panel2))}
+.btn.primary:hover:not(:disabled){background:color-mix(in srgb,var(--accent) 88%,#000);border-color:color-mix(in srgb,var(--accent) 88%,#000)}
+.nav button:hover{background:color-mix(in srgb,var(--accent) 7%,transparent);color:var(--text)}
+.nav button.active{box-shadow:inset 3px 0 0 var(--accent)}
+.panel,.stat,.login-card,.modal{border-radius:var(--radius);box-shadow:var(--shadow)}
+.field,.btn,.icon-btn,.health,.user-chip,.segmented,.view-toggle{border-radius:var(--radius-sm)}
+.field{width:100%;min-width:0;background:color-mix(in srgb,var(--panel2) 92%,var(--panel));border-color:var(--line)}
+.field:hover:not(:disabled){border-color:color-mix(in srgb,var(--accent) 32%,var(--line))}
+.field:focus{border-color:var(--accent);box-shadow:var(--focus);background:var(--panel)}
+.field:disabled{opacity:.62;cursor:not-allowed}
+.panel-head,.toolbar,.flow-controls,.modal-head,.modal-foot{min-width:0}
+.panel-title,.panel-note,.summary-context,.page-info,.setting-label,.setting-value,.health,.user-chip,.muted{overflow-wrap:anywhere}
+.header-left,.header-actions,.flow-left,.flow-right,.pager,.actions,.inline-form,.filter-actions,.port-desc-head,.port-desc-actions{min-width:0;max-width:100%}
+.table-wrap{max-width:100%;overscroll-behavior-inline:contain;scrollbar-width:thin}
+table{min-width:max-content}
+.modal{max-width:calc(100vw - 28px)}
+.modal-body,.modal-head,.modal-foot{min-width:0}
+.form-grid>* ,.filter-grid>* ,.settings-grid>* ,.cards>*{min-width:0}
+.datetime-mobile-wrap{min-width:0;max-width:100%}
+.datetime-mobile-wrap>.field{width:100%;min-width:0;max-width:100%}
+.toast{max-width:min(420px,calc(100vw - 24px));overflow-wrap:anywhere}
+
+/* Large desktop */
+@media(min-width:1281px){
+  .content{max-width:1800px;margin:0 auto}
+}
+/* Desktop / small laptop */
+@media(min-width:951px) and (max-width:1280px){
+  .cards{grid-template-columns:repeat(4,minmax(0,1fr))}
+  .filter-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+}
+
+/* v0.8.12: keep Dashboard period selectors compact on laptop/desktop. */
+@media(min-width:951px){
+  #dashboard .dashboard-period{width:132px;min-width:132px;max-width:132px;flex:0 0 132px}
+}
+
+/* Tablet */
+@media(min-width:561px) and (max-width:950px){
+  .header{height:auto;min-height:70px;gap:10px;padding-top:10px;padding-bottom:10px}
+  .header-left{flex:1 1 auto}.header-actions{flex:0 1 auto;flex-wrap:wrap;justify-content:flex-end}
+  .cards{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .filter-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .filter-actions{flex-wrap:wrap}
+  .setting-row{align-items:flex-start}
+  .inline-form{flex-wrap:wrap;justify-content:flex-end}
+  .port-add-row{grid-template-columns:minmax(90px,.8fr) minmax(100px,.8fr) minmax(0,2fr) 40px}
+}
+/* Phone */
+@media(max-width:560px){
+  .header{height:auto;min-height:62px;padding:8px 10px;gap:8px;align-items:center}
+  .header-left{min-width:0;flex:1}.header-actions{gap:6px;flex:0 1 auto;min-width:0}
+  .page-title{font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:42vw}
+  .user-chip{display:none}
+  .icon-btn{width:38px;min-width:38px;padding:0}
+  .content{width:100%;max-width:100%;padding:10px;overflow:hidden}
+  .cards{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .stat{min-width:0}.stat-title,.stat-sub{overflow-wrap:anywhere}.stat-value{font-size:18px;overflow-wrap:anywhere}
+  .panel{width:100%;max-width:100%;overflow:hidden}
+  .panel-head{align-items:flex-start;flex-wrap:wrap;gap:8px}.panel-head>div{min-width:0;flex:1 1 180px}.period-select{width:100%;min-width:0;flex:1 1 130px}
+  .toolbar,.flow-controls{width:100%;max-width:100%;padding:12px;overflow:hidden}
+  .filter-grid,.form-grid,.settings-grid{grid-template-columns:minmax(0,1fr);width:100%;max-width:100%}
+  .filter-grid>*,.form-grid>*,.settings-grid>*{width:100%;max-width:100%;min-width:0}
+  .filter-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  .filter-actions .btn{width:100%;min-width:0;padding:0 8px;white-space:normal;line-height:1.15}
+  .flow-left,.flow-right{width:100%;justify-content:flex-start}
+  .flow-right{overflow-wrap:anywhere}
+  .segmented,.view-toggle{display:flex;width:100%;max-width:100%}
+  .segmented button,.view-toggle button{flex:1 1 0;min-width:0;padding:0 8px;white-space:normal;line-height:1.15}
+  .pager{width:100%;display:grid;grid-template-columns:minmax(0,1fr) 40px minmax(74px,auto) 40px minmax(0,1fr);gap:5px}
+  .pager .btn{width:100%;min-width:0;padding:0 5px;font-size:11px}.pager .page-info{text-align:center;align-self:center}
+  .setting-row{display:grid;grid-template-columns:minmax(0,1fr);gap:6px;align-items:start}.setting-value{text-align:left;max-width:100%}
+  .inline-form{width:100%;display:grid;grid-template-columns:minmax(0,1fr);align-items:stretch}.inline-form .field{width:100%}.inline-form .btn{width:100%}
+  .port-desc-head{align-items:stretch;flex-direction:column}.port-desc-head .btn{width:100%}
+  .port-add-row{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+  .port-add-row .field{width:100%}.port-add-row .port-desc-input{grid-column:1/-1}.port-add-row .remove-port-row{grid-column:1/-1;justify-self:stretch;width:100%}
+  .actions,.port-desc-actions{flex-wrap:wrap}.actions>* ,.port-desc-actions>*{min-width:0}
+  .modal-backdrop{padding:8px}.modal{width:100%;max-width:100%;max-height:94vh;border-radius:12px}.modal-head,.modal-body,.modal-foot{padding:12px}.modal-head{gap:8px}.modal-foot{flex-wrap:wrap;gap:8px}.modal-foot .btn{flex:1 1 120px;min-width:0}
+  .delete-progress-meta{flex-wrap:wrap}
+  .pie-row,.device-row{min-width:0}.pie-box,.chart-box,.flows-chart-panel{width:100%;max-width:100%;height:230px}
+  .rank-item{grid-template-columns:20px minmax(0,1fr) auto}.rank-value{max-width:34vw;overflow:hidden;text-overflow:ellipsis}
+  .panel .table-wrap{padding-left:10px;padding-right:10px}
+  th,td{padding:9px 7px}
+  .toast{left:10px;right:10px;bottom:10px;width:auto;max-width:none}
+}
+/* Very narrow phones */
+@media(max-width:380px){
+  .cards{grid-template-columns:minmax(0,1fr)}
+  .page-title{max-width:34vw}
+  .filter-actions{grid-template-columns:minmax(0,1fr)}
+  .pager{grid-template-columns:1fr 1fr}.pager .page-info{grid-column:1/-1;grid-row:1}.pager .btn{font-size:10px}
+}
+
+/* v0.8.12: tablet Dashboard period controls, collapsible desktop sidebar, navigation icons and styled table scrollbars. */
+@media (min-width:561px) and (max-width:950px){
+  #dashboard .dashboard-period{width:132px;min-width:132px;max-width:132px;flex:0 0 132px}
+}
+.nav button .nav-icon{width:20px;height:20px;min-width:20px;display:grid;place-items:center}
+.nav button .nav-icon svg{width:19px;height:19px;display:block}
+.nav button .nav-label{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.brand-copy{min-width:0;flex:1;overflow:hidden}
+.sidebar-collapse{margin-left:auto;width:30px;height:30px;border:0;border-radius:8px;background:transparent;color:var(--muted);display:grid;place-items:center;cursor:pointer;transition:.18s ease}
+.sidebar-collapse:hover{background:var(--accent-soft);color:var(--accent)}
+.sidebar-collapse svg{width:17px;height:17px;transition:transform .2s ease}
+.login-brand{display:flex;flex-direction:column;align-items:center;text-align:center;margin-bottom:18px}
+.login-logo{width:58px;height:58px;border-radius:16px;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center;margin-bottom:12px;box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--accent) 16%,transparent)}
+.login-logo svg{width:32px;height:32px}
+.login-brand h1{margin:0 0 5px}.login-brand p{margin:0}
+.table-wrap{scrollbar-width:thin;scrollbar-color:color-mix(in srgb,var(--accent) 55%,var(--muted)) var(--panel2)}
+.table-wrap::-webkit-scrollbar{height:10px;width:10px}
+.table-wrap::-webkit-scrollbar-track{background:var(--panel2);border-radius:999px}
+.table-wrap::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--accent) 48%,var(--muted));border:2px solid var(--panel2);border-radius:999px}
+.table-wrap::-webkit-scrollbar-thumb:hover{background:color-mix(in srgb,var(--accent) 72%,var(--muted))}
+@media (min-width:951px){
+  .sidebar,.main{transition:width .22s ease,margin-left .22s ease}
+  body.sidebar-collapsed .sidebar{width:72px}
+  body.sidebar-collapsed .main{margin-left:72px}
+  body.sidebar-collapsed .brand{padding:0 12px;justify-content:center}
+  body.sidebar-collapsed .brand-copy,body.sidebar-collapsed .sidebar-footer,body.sidebar-collapsed .nav-label{display:none}
+  body.sidebar-collapsed .brand .logo{width:38px;height:38px;min-width:38px}
+  body.sidebar-collapsed .sidebar-collapse{position:absolute;left:55px;top:20px;width:26px;height:30px;background:var(--panel);border:1px solid var(--line);box-shadow:var(--shadow)}
+  body.sidebar-collapsed .sidebar-collapse svg{transform:rotate(180deg)}
+  body.sidebar-collapsed .nav{padding:14px 9px}
+  body.sidebar-collapsed .nav button{width:54px;padding:0;justify-content:center;gap:0}
+  body.sidebar-collapsed .nav button.active{box-shadow:inset 3px 0 0 var(--accent)}
+}
+@media(max-width:950px){.sidebar-collapse{display:none}}
+
+
+/* v0.8.12: compact, single-line view and row-count controls at every breakpoint. */
+#flows .flow-controls:first-of-type > .flow-left,
+#conversation .flow-controls:first-of-type > .flow-left{
+  display:flex;flex-direction:row;align-items:center;justify-content:flex-start;
+  flex-wrap:nowrap;width:auto;max-width:100%;min-width:0;gap:10px;
+}
+#flows #flowMode,#conversation #conversationMode{
+  display:inline-flex;flex:0 0 auto;width:auto;max-width:none;min-width:0;
+}
+#flows #flowMode button,#conversation #conversationMode button{
+  flex:0 0 auto;min-width:0;white-space:nowrap;padding:0 13px;
+}
+#flows #pageSizeWrap{display:inline-flex;align-items:center;flex:0 0 auto;flex-wrap:nowrap;
+  width:auto;min-width:0;gap:7px;white-space:nowrap;}
+#flows #pageSizeWrap.hidden{display:none!important;}
+#flows #flowPageSize,#conversation #conversationLimit{
+  flex:0 0 76px;width:76px;min-width:76px;max-width:76px;
+}
+#flows #summaryContext{flex:0 1 auto;min-width:0;overflow-wrap:anywhere;}
+#conversation .flow-controls:first-of-type > .flow-left > .page-info{flex:0 0 auto;white-space:nowrap;}
+@media(max-width:560px){
+  #flows .flow-controls:first-of-type,#conversation .flow-controls:first-of-type{overflow-x:auto;}
+  #flows .flow-controls:first-of-type > .flow-left,
+  #conversation .flow-controls:first-of-type > .flow-left{flex-wrap:nowrap;width:max-content;max-width:none;}
+  #flows #flowMode,#conversation #conversationMode{width:auto;}
+  #flows #flowMode button,#conversation #conversationMode button{padding:0 9px;}
+  #flows #summaryContext{max-width:140px;}
+}
 </style>
 </head>
 <body>
-<div class="login-screen" id="loginScreen"><form class="login-card" id="loginForm"><h1>Simple NetFlow Server</h1><p>Sign in to continue</p><input class="field" id="loginUser" autocomplete="username" placeholder="Username" required><input class="field" id="loginPassword" type="password" autocomplete="current-password" placeholder="Password" required><button class="btn primary" type="submit">Sign in</button><div class="readonly-note" id="loginError"></div></form></div>
+<div class="login-screen" id="loginScreen"><form class="login-card" id="loginForm"><div class="login-brand"><div class="login-logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M4 17h3v3H4zM17 4h3v3h-3zM17 17h3v3h-3zM10.5 10.5h3v3h-3z"/><path d="M7 18.5h10M18.5 7v10M7 17l4.5-4.5M13 11l4-4"/></svg></div><h1>Simple NetFlow Server</h1><p>Sign in to continue</p></div><input class="field" id="loginUser" autocomplete="username" placeholder="Username" required><input class="field" id="loginPassword" type="password" autocomplete="current-password" placeholder="Password" required><button class="btn primary" type="submit">Sign in</button><div class="readonly-note" id="loginError"></div></form></div>
 <aside class="sidebar" id="sidebar">
- <div class="brand"><div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M4 17h3v3H4zM17 4h3v3h-3zM17 17h3v3h-3zM10.5 10.5h3v3h-3z"/><path d="M7 18.5h10M18.5 7v10M7 17l4.5-4.5M13 11l4-4"/></svg></div><div><div class="brand-title">Simple NetFlow Server</div><div class="brand-version">v0.8.7</div></div></div>
- <nav class="nav"><button class="active" data-view="dashboard">Dashboard</button><button data-view="flows">Flows</button><button data-view="conversation">Conversation</button><button data-view="exporters">Exporters</button><button data-view="settings">Settings</button></nav>
+ <div class="brand"><div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M4 17h3v3H4zM17 4h3v3h-3zM17 17h3v3h-3zM10.5 10.5h3v3h-3z"/><path d="M7 18.5h10M18.5 7v10M7 17l4.5-4.5M13 11l4-4"/></svg></div><div class="brand-copy"><div class="brand-title">Simple NetFlow Server</div><div class="brand-version">v0.8.12</div></div><button class="sidebar-collapse" id="sidebarCollapse" title="Collapse sidebar" aria-label="Collapse sidebar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></button></div>
+ <nav class="nav"><button class="active" data-view="dashboard" title="Dashboard"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></span><span class="nav-label">Dashboard</span></button><button data-view="flows" title="Flows"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h11"/><path d="m12 3 3 3-3 3"/><path d="M20 18H9"/><path d="m12 15-3 3 3 3"/></svg></span><span class="nav-label">Flows</span></button><button data-view="conversation" title="Conversation"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="19" cy="18" r="2"/><path d="M7 6h10M7 18h10M5 8v8M19 8v8M9 9l6 6M15 9l-6 6"/></svg></span><span class="nav-label">Conversation</span></button><button data-view="exporters" title="Exporters"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="6" rx="2"/><rect x="3" y="14" width="18" height="6" rx="2"/><path d="M7 7h.01M7 17h.01M11 7h6M11 17h6"/></svg></span><span class="nav-label">Exporters</span></button><button data-view="settings" title="Settings"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21h-4v-.1A1.7 1.7 0 0 0 8.6 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H3v-4h.1A1.7 1.7 0 0 0 4.6 8.6a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1V3h4v.1A1.7 1.7 0 0 0 15.4 4.6a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 9c.16.36.38.68.66.94.3.27.67.42 1.07.43H21v4h-.1a1.7 1.7 0 0 0-1.5.63z"/></svg></span><span class="nav-label">Settings</span></button></nav>
  <div class="sidebar-footer">Lightweight NetFlow / IPFIX / sFlow analyzer</div>
 </aside><div class="overlay" id="overlay"></div>
 <div class="main">
@@ -87,7 +259,7 @@
 <section id="settings" class="view"><div class="settings-grid">
 <section class="panel setting-card full-width"><div class="panel-title">Storage</div><div class="setting-row"><span class="setting-label">Database</span><span class="setting-value">PostgreSQL 16</span></div><div class="setting-row"><span class="setting-label">Detailed conversations retention</span><span class="inline-form"><select class="field" id="rawRetentionHours"><option value="1">1 hour</option><option value="3">3 hours</option><option value="6">6 hours</option><option value="12">12 hours</option><option value="24">24 hours</option></select></span></div><div class="panel-note">Detailed data is retained for the selected period: 1, 3, 6, 12 or 24 hours.</div><div class="setting-row"><span class="setting-label">Statistics retention</span><span class="inline-form"><input class="field" id="statsRetentionDays" type="number" min="1" max="3650" value="30"><span>days</span><button class="btn primary" id="saveRetention">Save</button></span></div><div class="panel-note">Minimum 1 day. Recommended up to 30 days. Longer retention requires additional database storage.</div><div class="setting-row"><span class="setting-label">Conversation data</span><span class="setting-value" id="rawDataSize">—</span></div><div class="setting-row"><span class="setting-label">Conversation indexes</span><span class="setting-value" id="rawIndexSize">—</span></div><div class="setting-row"><span class="setting-label">Aggregates</span><span class="setting-value" id="aggregateSize">—</span></div><div class="setting-row"><span class="setting-label">Total database</span><span class="setting-value" id="totalDbSize">—</span></div><div class="setting-row"><span class="setting-label">Spool</span><span class="setting-value" id="storageSpoolStatus">—</span></div><div class="setting-row"><span class="setting-label">Statistics resolution</span><span class="setting-value">5-minute historical conversations</span></div><div class="setting-row"><span class="setting-label">Cleanup interval</span><span class="setting-value">Every hour</span></div></section>
 <section class="panel setting-card"><div class="panel-title">SNMP enrichment</div><div class="setting-row"><span class="setting-label">SNMP version</span><span class="setting-value">SNMP v2c</span></div><div class="setting-row"><span class="setting-label">Data</span><span class="setting-value">Hostname, interfaces, speed, status</span></div><div class="setting-row"><span class="setting-label">Flow mapping</span><span class="setting-value">ifIndex → interface name</span></div></section>
-<section class="panel setting-card"><div class="panel-title">Application</div><div class="setting-row"><span class="setting-label">Name</span><span class="setting-value">Simple NetFlow Server</span></div><div class="setting-row"><span class="setting-label">Version</span><span class="setting-value">0.8.7</span></div><div class="setting-row"><span class="setting-label">Theme</span><span class="setting-value">Dark / Light</span></div></section>
+<section class="panel setting-card"><div class="panel-title">Application</div><div class="setting-row"><span class="setting-label">Name</span><span class="setting-value">Simple NetFlow Server</span></div><div class="setting-row"><span class="setting-label">Version</span><span class="setting-value">0.8.10</span></div><div class="setting-row"><span class="setting-label">Theme</span><span class="setting-value">Dark / Light</span></div></section>
 <section class="panel setting-card"><div class="panel-title">Collector</div><div class="setting-row"><span class="setting-label">NetFlow / IPFIX</span><span class="setting-value">UDP 2055</span></div><div class="setting-row"><span class="setting-label">sFlow</span><span class="setting-value">UDP 6343</span></div><div class="setting-row"><span class="setting-label">Decoder</span><span class="setting-value">GoFlow2</span></div></section>
 <section class="panel setting-card" id="usersCard"><div class="panel-title">Users</div><div class="panel-note">Change your own password here. Administrator can also manage other users.</div><div class="users-form admin-only"><input class="field" id="newUsername" placeholder="Username"><input class="field" id="newPassword" type="password" placeholder="Password (min 6)"><select class="field" id="newRole"><option value="user">User</option><option value="administrator">Administrator</option></select><button class="btn primary" id="addUser">Add</button></div><div class="users-list"><table><thead><tr><th>User</th><th>Role</th><th>Action</th></tr></thead><tbody id="userRows"></tbody></table></div></section>
 <section class="panel setting-card full-width" id="portDescriptionsCard"><div class="port-desc-head"><div><div class="panel-title">Port descriptions</div><div class="panel-note">Custom application/service names by protocol and port. Example: Proxmox TCP/8006.</div></div><button class="btn primary admin-only" id="openAddPorts">Add</button></div><div class="table-wrap" style="margin-top:12px"><table><thead><tr><th>Protocol</th><th>Port</th><th>Description</th><th>Display</th><th class="admin-only">Actions</th></tr></thead><tbody id="portDescriptionRows"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody></table></div></section>
@@ -350,6 +522,10 @@ function initMobileDatetimeHints(){
 }
 function show(name){$$('.nav button').forEach(b=>b.classList.toggle('active',b.dataset.view===name));$$('.view').forEach(v=>v.classList.toggle('active',v.id===name));$('#pageTitle').textContent=name[0].toUpperCase()+name.slice(1);$('#sidebar').classList.remove('open');$('#overlay').classList.remove('show');if(name==='dashboard')loadDashboard();if(name==='flows'){loadSettings().then(()=>exporterOptions().then(()=>loadFlows()))}if(name==='conversation'){loadSettings().then(()=>conversationExporterOptions().then(()=>loadConversations()))}if(name==='exporters')loadExporters();if(name==='settings'){loadSettings();loadUsers();loadPortDescriptions()}}
 
+function applySidebarState(){if(window.innerWidth<=950){document.body.classList.remove('sidebar-collapsed');return}document.body.classList.toggle('sidebar-collapsed',localStorage.getItem('sidebarCollapsed')==='1')}
+applySidebarState();
+$('#sidebarCollapse').addEventListener('click',()=>{const collapsed=!document.body.classList.contains('sidebar-collapsed');document.body.classList.toggle('sidebar-collapsed',collapsed);localStorage.setItem('sidebarCollapsed',collapsed?'1':'0');$('#sidebarCollapse').title=collapsed?'Expand sidebar':'Collapse sidebar'});
+window.addEventListener('resize',applySidebarState);
 $$('.nav button').forEach(b=>b.addEventListener('click',()=>show(b.dataset.view)));
 $('#hPeriod').addEventListener('change',()=>{const custom=$('#hPeriod').value==='custom';$('#hFrom').disabled=$('#hTo').disabled=!custom});$('#hExporter').addEventListener('change',async()=>{historyPage=1;if($('#hKind').value==='interface')await historyInterfaceOptions()});$('#hKind').addEventListener('change',async()=>{historyPage=1;await updateHistoryFilterAvailability();loadHistory()});$('#applyHistoryFilters').addEventListener('click',()=>{historyPage=1;loadHistory()});$('#clearHistoryFilters').addEventListener('click',async()=>{$('#hKind').value='src';$('#hPeriod').value='all';$('#hSearch').value='';$('#hProto').value='';$('#hExporter').value='';$('#hInterface').innerHTML='<option value="">All interfaces</option>';$('#hFrom').value=$('#hTo').value='';$('#hFrom').disabled=$('#hTo').disabled=true;historyPage=1;await updateHistoryFilterAvailability();loadHistory()});$('#historyLimit').addEventListener('change',()=>{historyPage=1;loadHistory()});$('#historyFirstPage').addEventListener('click',()=>{historyPage=1;loadHistory()});$('#historyPrevPage').addEventListener('click',()=>{if(historyPage>1){historyPage--;loadHistory()}});$('#historyNextPage').addEventListener('click',()=>{const pages=Math.max(1,Math.ceil(historyTotal/Number($('#historyLimit').value||50)));if(historyPage<pages){historyPage++;loadHistory()}});$('#historyLastPage').addEventListener('click',()=>{historyPage=Math.max(1,Math.ceil(historyTotal/Number($('#historyLimit').value||50)));loadHistory()});
 $('#applyConversationFilters').addEventListener('click',()=>{const p=$('#cPeriod').value;if(p&&p!=='custom')captureConversationPeriodSnapshot(p);else clearConversationPeriodSnapshot();conversationPage=1;loadConversations()});
@@ -424,9 +600,9 @@ async function bootstrapRealtime(){
  if(bootstrapRunning)return;bootstrapRunning=true;
  try{
    const x=await api('/api/health');
-   if(x.version!=='0.8.7'){
+   if(x.version!=='0.8.12'){
      const h=$('#backendStatus');h.style.color='var(--orange)';h.textContent=`Backend: v${x.version}`;
-     toast(`Backend ${x.version} detected. Rebuild backend for v0.8.7 API.`,true);
+     toast(`Backend ${x.version} detected. Rebuild backend for v0.8.12 API.`,true);
      return;
    }
    if(bootstrapTimer){clearTimeout(bootstrapTimer);bootstrapTimer=null}

@@ -1,4 +1,81 @@
-## v0.7.11
+## v0.8.12
+
+- Fixed frontend/backend API version guard: frontend now accepts backend v0.8.12 instead of incorrectly checking for v0.8.10.
+- Preserved the v0.8.11 Flows and Conversation inline controls and Conversation network icon.
+- No database, collector, retention, or storage schema changes.
+
+## v0.8.12
+
+- Align Flows Detailed / Summary / Rows and row count on one line.
+- Align Conversation Table / Chart / Show and row count on one line.
+- Replace Conversation chat bubble icon with a network traffic relationship icon.
+- Preserve existing API, data storage and both themes.
+
+# v0.8.10
+
+- Dashboard: compact period selectors on tablet widths (561–950 px).
+- Login: added application logo and improved branding.
+- Navigation: added semantic icons for Dashboard, Flows, Conversation, Exporters and Settings.
+- Desktop: sidebar can collapse to icon-only mode; state is saved in the browser.
+- Sidebar: application logo remains visible in expanded and collapsed desktop modes.
+- Tables: styled horizontal/vertical scrollbars for Light and Dark themes.
+- No API, database, retention, collector or flow-processing changes.
+
+# v0.8.10
+
+- Dashboard: period selectors are compact again on laptop/desktop widths (951px and above).
+- Tablet/mobile period selectors remain responsive.
+- No API, database, retention, collector, or storage changes.
+
+# v0.8.10
+
+- Responsive audit across phone, tablet, laptop and desktop layouts.
+- Added global overflow protection for inputs, buttons, labels, cards, filters, modals, status elements and controls.
+- Improved responsive header, pagers, settings forms, port-description forms and filter actions.
+- Refreshed GUI styling while preserving the existing navigation, layout and functionality.
+- Improved focus, hover, panel, field and button styling in both Light and Dark themes.
+- Tables remain horizontally scrollable inside their own containers on narrow screens instead of overflowing the page.
+
+# v0.8.10
+
+- Fixed frontend/backend version synchronization.
+- Settings → Application now displays version 0.8.10.
+- Backend status guard now expects API version 0.8.10, so a matching backend is shown healthy instead of yellow.
+- No database, retention, statistics, or spool changes.
+
+# v0.8.6
+
+- Custom period uses Detailed data only when both `From` and `To` are inside the current Detailed conversations retention window.
+- If either `From` or `To` is outside that window, Flows and Conversation use 5-minute Statistics.
+
+# v0.8.6
+
+- Flows and Conversation: Custom period now uses Detailed data when the selected interval is fully within Detailed conversations retention.
+- Custom period automatically switches to 5-minute Statistics only when the selected start is older than the Detailed retention cutoff.
+- Result status explicitly identifies Detailed custom period vs 5-minute statistics.
+- Synchronized frontend/backend/Compose version to 0.8.6.
+- No database or spool reset required.
+
+# v0.8.4
+
+- Fixed duplicate datetime hint text in desktop Flows and Conversation filters.
+- The custom `дд.мм.рррр --:--` overlay is now mobile-only; desktop uses the browser native datetime-local display.
+- No database, API, retention, or spool changes.
+
+## v0.8.4
+
+- Fixed mobile Flows filters overflowing beyond the viewport.
+- Flows filter controls now stay within the phone screen without horizontal scrolling, matching Conversation behavior.
+- Added fixed Detailed retention choices: 1, 3, 6, 12, 24 hours.
+- Changed Statistics retention to days only, minimum 1 day; UI recommends a maximum of 30 days for storage efficiency.
+- Flow/Conversation period presets now follow Detailed retention.
+- Custom period now uses compact 5-minute historical Source → Destination statistics.
+- Added `flow_stats_conversations_5m`, excluding ephemeral client ports to limit database growth.
+- Added in-place migration from legacy Statistics hours to days and first-start backfill from retained Detailed conversations.
+- Exporter deletion now purges historical conversation statistics too.
+- No database or spool reset required.
+
+## v0.7.12
 
 - Reordered the top-right header controls.
 - `Logout` is now the rightmost icon button.
