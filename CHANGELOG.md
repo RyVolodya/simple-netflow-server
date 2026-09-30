@@ -1,3 +1,51 @@
+## v0.8.22
+- Align Source/Destination ports with the top DNS/custom-name line; when no name exists, align the port with the IP address.
+- Render IP addresses at the same font size as ports and primary endpoint text.
+- Render IP addresses using the primary text color in both Light and Dark themes.
+
+# v0.8.22
+
+- Fixed backend/frontend version synchronization: Docker Compose now passes APP_VERSION 0.8.22.
+- Enforced `Name (IP)` spacing at render time for existing and new PTR, local, and manually named IP data.
+- Added build verification for Compose/backend/frontend version consistency.
+
+# v0.8.18
+- Legacy name/IP spacing is normalized at render time for existing and new PTR, local and manually named IP records (`Name (IP)`).
+
+- Added consistent spacing in host/DNS labels: `Name (IP)` instead of `Name(IP)`.
+- Made Settings → IP address names input fields wider and responsive across desktop, tablet, and mobile layouts.
+- Added `Collapse menu` text to the desktop sidebar control; the text is hidden automatically while the sidebar is collapsed.
+
+# v0.8.16
+
+- Moved the desktop sidebar Collapse / Expand control to the bottom of the sidebar.
+- Preserved the collapsed sidebar state and icon-only behavior.
+- No database, collector, or API changes.
+
+# v0.8.16
+
+- Reverse DNS (PTR) resolution explicitly supports global IPv4 and IPv6 addresses.
+- Dashboard Top Source/Top Destination charts and ranking lists show resolved/custom names with the IP address on a second line.
+- Flow and Conversation IP cells use a two-line Name + (IP address) layout when a name is available.
+- Restyled horizontal and vertical scrollbars globally for Light and Dark themes.
+- No database reset is required.
+
+# v0.8.16
+
+- Added custom names for exporter interfaces; manual names are preserved across SNMP polling.
+- Added optional reverse DNS (PTR) resolution for global unicast IP addresses, disabled by default, with 24-hour positive/negative cache.
+- Added custom IP address names with priority over DNS names.
+- IP names are displayed alongside addresses in Flows and Conversation views.
+- No flow-storage reset is required.
+
+# v0.8.16
+
+- Exporters: added administrator-defined custom names while preserving exporter IP and SNMP hostname.
+- Exporter custom names are used in exporter selectors and Dashboard device/interface labels.
+- Dashboard drill-down to Flows now resets all unrelated Flow filters before applying the clicked chart selection.
+- Fixed stale Interface/Exporter and other hidden filters affecting Dashboard chart drill-down results.
+- Version synchronization updated to v0.8.16.
+
 ## v0.8.12
 
 - Fixed frontend/backend API version guard: frontend now accepts backend v0.8.12 instead of incorrectly checking for v0.8.10.

@@ -32,7 +32,7 @@ COLLECTOR_PID = int(os.getenv("COLLECTOR_PID", "1"))
 DEFAULT_RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "30"))
 DEFAULT_RAW_RETENTION_HOURS = int(os.getenv("RAW_RETENTION_HOURS", "24"))
 DEFAULT_STATS_RETENTION_DAYS = int(os.getenv("STATS_RETENTION_DAYS", "30"))
-VERSION = os.getenv("APP_VERSION", "0.8.12")
+VERSION = os.getenv("APP_VERSION", "0.8.22")
 DEFAULT_ADMIN_USER = os.getenv("ADMIN_USERNAME", "admin")
 DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "netflow")
 SESSION_HOURS = int(os.getenv("SESSION_HOURS", "24"))
@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS exporters (
   first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
   last_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
   hostname TEXT,
+  custom_name TEXT,
   sys_descr TEXT,
   snmp_enabled BOOLEAN NOT NULL DEFAULT false,
   snmp_version TEXT NOT NULL DEFAULT '2c',
@@ -106,6 +107,7 @@ CREATE TABLE IF NOT EXISTS interfaces (
   if_name TEXT,
   if_descr TEXT,
   if_alias TEXT,
+  custom_name TEXT,
   if_speed BIGINT,
   admin_status INTEGER,
   oper_status INTEGER,
@@ -113,6 +115,17 @@ CREATE TABLE IF NOT EXISTS interfaces (
   UNIQUE(exporter, if_index)
 );
 CREATE INDEX IF NOT EXISTS idx_interfaces_exporter ON interfaces(exporter);
+
+CREATE TABLE IF NOT EXISTS ip_names (
+  ip INET PRIMARY KEY,
+  name TEXT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS dns_cache (
+  ip INET PRIMARY KEY,
+  hostname TEXT,
+  resolved_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 CREATE TABLE IF NOT EXISTS app_settings (
   key TEXT PRIMARY KEY,
@@ -1123,6 +1136,9 @@ def rebuild_aggregates(force=False):
 
 def bootstrap_metadata():
     with conn() as c, c.cursor() as cur:
+        cur.execute("ALTER TABLE exporters ADD COLUMN IF NOT EXISTS custom_name TEXT")
+        cur.execute("ALTER TABLE interfaces ADD COLUMN IF NOT EXISTS custom_name TEXT")
+        cur.execute("INSERT INTO app_settings(key,value) VALUES('dns_resolution_enabled','false') ON CONFLICT(key) DO NOTHING")
         cur.execute(
             """INSERT INTO exporters(ip, first_seen, last_seen)
                SELECT exporter, min(first_seen), max(last_seen)
@@ -1232,6 +1248,16 @@ class PortDescriptionUpdateRequest(BaseModel):
 
 class ExporterDeleteRequest(BaseModel):
     exporter: str
+
+class ExporterNameUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=100)
+
+class InterfaceNameUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=100)
+
+class IpNameUpdate(BaseModel):
+    ip: str
+    name: str = Field(min_length=1, max_length=100)
 
 class UserCreate(BaseModel):
     username: str = Field(min_length=1, max_length=64)
@@ -1487,14 +1513,14 @@ def top(kind: str = Query("src", pattern="^(src|dst|port|exporter|proto|app)$"),
             return rows
         if kind=='exporter':
             cur.execute("""SELECT host(a.exporter) exporter,
-                                  CASE WHEN nullif(e.hostname,'') IS NOT NULL
-                                       THEN e.hostname || ' (' || host(a.exporter) || ')'
+                                  CASE WHEN coalesce(nullif(e.custom_name,''),nullif(e.hostname,'')) IS NOT NULL
+                                       THEN coalesce(nullif(e.custom_name,''),nullif(e.hostname,'')) || ' (' || host(a.exporter) || ')'
                                        ELSE host(a.exporter) END AS label,
                                   sum(a.bytes)::bigint bytes,sum(a.flows)::bigint flows
                            FROM flow_agg_exporter_1m a
                            LEFT JOIN exporters e ON e.ip=a.exporter
                            WHERE a.bucket>=now()-(%s || ' hours')::interval
-                           GROUP BY a.exporter,e.hostname ORDER BY bytes DESC LIMIT %s""",(h,limit))
+                           GROUP BY a.exporter,e.custom_name,e.hostname ORDER BY bytes DESC LIMIT %s""",(h,limit))
             return cur.fetchall()
         if kind in table_map:
             table,col=table_map[kind]
@@ -1512,11 +1538,11 @@ def top_interfaces(hours: int = 1, limit: int = 10):
         cur.execute("""WITH s AS (SELECT exporter,if_index,sum(bytes)::bigint bytes,sum(flows)::bigint flows FROM flow_agg_interface_1m
                                   WHERE bucket>=now()-(%s || ' hours')::interval GROUP BY exporter,if_index)
                        SELECT host(s.exporter) exporter,s.if_index,
-                              CASE WHEN nullif(i.if_alias,'') IS NOT NULL THEN coalesce(nullif(i.if_name,''),nullif(i.if_descr,''),'ifIndex '||s.if_index::text)||' ('||i.if_alias||')'
-                                   ELSE coalesce(nullif(i.if_name,''),nullif(i.if_descr,''),'ifIndex '||s.if_index::text) END interface_name,
-                              coalesce(nullif(e.hostname,''),host(s.exporter)) device_name,
-                              (CASE WHEN nullif(i.if_alias,'') IS NOT NULL THEN coalesce(nullif(i.if_name,''),nullif(i.if_descr,''),'ifIndex '||s.if_index::text)||' ('||i.if_alias||')'
-                                    ELSE coalesce(nullif(i.if_name,''),nullif(i.if_descr,''),'ifIndex '||s.if_index::text) END)||' ('||coalesce(nullif(e.hostname,''),host(s.exporter))||')' label,
+                              CASE WHEN nullif(i.if_alias,'') IS NOT NULL THEN coalesce(nullif(i.custom_name,''),nullif(i.if_name,''),nullif(i.if_descr,''),'ifIndex '||s.if_index::text)||' ('||i.if_alias||')'
+                                   ELSE coalesce(nullif(i.custom_name,''),nullif(i.if_name,''),nullif(i.if_descr,''),'ifIndex '||s.if_index::text) END interface_name,
+                              coalesce(nullif(e.custom_name,''),nullif(e.hostname,''),host(s.exporter)) device_name,
+                              (CASE WHEN nullif(i.if_alias,'') IS NOT NULL THEN coalesce(nullif(i.custom_name,''),nullif(i.if_name,''),nullif(i.if_descr,''),'ifIndex '||s.if_index::text)||' ('||i.if_alias||')'
+                                    ELSE coalesce(nullif(i.custom_name,''),nullif(i.if_name,''),nullif(i.if_descr,''),'ifIndex '||s.if_index::text) END)||' ('||coalesce(nullif(e.custom_name,''),nullif(e.hostname,''),host(s.exporter))||')' label,
                               s.bytes,s.flows FROM s LEFT JOIN interfaces i ON i.exporter=s.exporter AND i.if_index=s.if_index
                               LEFT JOIN exporters e ON e.ip=s.exporter ORDER BY s.bytes DESC LIMIT %s""",(h,limit))
         return cur.fetchall()
@@ -1632,7 +1658,7 @@ def build_flow_filter(
 
 FLOW_SORT_COLUMNS = {
     "received_at": "f.received_at",
-    "exporter": "COALESCE(e.hostname, host(f.exporter))",
+    "exporter": "COALESCE(NULLIF(e.custom_name,''),NULLIF(e.hostname,''),host(f.exporter))",
     "src": "f.src_addr",
     "dst": "f.dst_addr",
     "proto": "f.proto",
@@ -1673,10 +1699,10 @@ def flows(
     params += [min(max(limit, 1), 100), max(offset, 0)]
     with conn() as c, c.cursor() as cur:
         cur.execute(
-            f"""SELECT f.id,f.received_at,f.flow_time,f.first_seen,f.last_seen,f.flow_count,host(f.exporter) exporter,e.hostname exporter_hostname,f.flow_type,
+            f"""SELECT f.id,f.received_at,f.flow_time,f.first_seen,f.last_seen,f.flow_count,host(f.exporter) exporter,coalesce(nullif(e.custom_name,''),nullif(e.hostname,'')) exporter_hostname,f.flow_type,
                        host(f.src_addr) src_addr,host(f.dst_addr) dst_addr,f.src_port,f.dst_port,f.proto,f.bytes,f.packets,
                        f.in_if,f.out_if,f.service_port,f.service_side,
-                       CASE WHEN nullif(ii.if_alias,'') IS NOT NULL THEN coalesce(nullif(ii.if_name,''),nullif(ii.if_descr,''),'ifIndex '||f.in_if::text)||' ('||ii.if_alias||')' ELSE COALESCE(NULLIF(ii.if_name,''),NULLIF(ii.if_descr,'')) END in_if_name, CASE WHEN nullif(oi.if_alias,'') IS NOT NULL THEN coalesce(nullif(oi.if_name,''),nullif(oi.if_descr,''),'ifIndex '||f.out_if::text)||' ('||oi.if_alias||')' ELSE COALESCE(NULLIF(oi.if_name,''),NULLIF(oi.if_descr,'')) END out_if_name,
+                       CASE WHEN nullif(ii.if_alias,'') IS NOT NULL THEN coalesce(nullif(ii.custom_name,''),nullif(ii.if_name,''),nullif(ii.if_descr,''),'ifIndex '||f.in_if::text)||' ('||ii.if_alias||')' ELSE COALESCE(NULLIF(ii.custom_name,''),NULLIF(ii.if_name,''),NULLIF(ii.if_descr,'')) END in_if_name, CASE WHEN nullif(oi.if_alias,'') IS NOT NULL THEN coalesce(nullif(oi.custom_name,''),nullif(oi.if_name,''),nullif(oi.if_descr,''),'ifIndex '||f.out_if::text)||' ('||oi.if_alias||')' ELSE COALESCE(NULLIF(oi.custom_name,''),NULLIF(oi.if_name,''),NULLIF(oi.if_descr,'')) END out_if_name,
                        f.sampling_rate
                 FROM flow_conversations_5m f
                 LEFT JOIN exporters e ON e.ip=f.exporter
@@ -1875,9 +1901,9 @@ def conversations(
     with conn() as c, c.cursor() as cur:
         if group_by == 'interface':
             cur.execute(f"""SELECT host(f.exporter) exporter,f.in_if,f.out_if,
-                       CASE WHEN nullif(ii.if_alias,'') IS NOT NULL THEN coalesce(nullif(ii.if_name,''),nullif(ii.if_descr,''),'ifIndex '||coalesce(f.in_if::text,'—'))||' ('||ii.if_alias||')' ELSE coalesce(nullif(ii.if_name,''),nullif(ii.if_descr,''),'ifIndex '||coalesce(f.in_if::text,'—')) END in_if_name,
-                       CASE WHEN nullif(oi.if_alias,'') IS NOT NULL THEN coalesce(nullif(oi.if_name,''),nullif(oi.if_descr,''),'ifIndex '||coalesce(f.out_if::text,'—'))||' ('||oi.if_alias||')' ELSE coalesce(nullif(oi.if_name,''),nullif(oi.if_descr,''),'ifIndex '||coalesce(f.out_if::text,'—')) END out_if_name,
-                       coalesce(nullif(e.hostname,''),host(f.exporter)) device_name,
+                       CASE WHEN nullif(ii.if_alias,'') IS NOT NULL THEN coalesce(nullif(ii.custom_name,''),nullif(ii.if_name,''),nullif(ii.if_descr,''),'ifIndex '||coalesce(f.in_if::text,'—'))||' ('||ii.if_alias||')' ELSE coalesce(nullif(ii.custom_name,''),nullif(ii.if_name,''),nullif(ii.if_descr,''),'ifIndex '||coalesce(f.in_if::text,'—')) END in_if_name,
+                       CASE WHEN nullif(oi.if_alias,'') IS NOT NULL THEN coalesce(nullif(oi.custom_name,''),nullif(oi.if_name,''),nullif(oi.if_descr,''),'ifIndex '||coalesce(f.out_if::text,'—'))||' ('||oi.if_alias||')' ELSE coalesce(nullif(oi.custom_name,''),nullif(oi.if_name,''),nullif(oi.if_descr,''),'ifIndex '||coalesce(f.out_if::text,'—')) END out_if_name,
+                       coalesce(nullif(e.custom_name,''),nullif(e.hostname,''),host(f.exporter)) device_name,
                        coalesce(sum(f.bytes),0)::bigint bytes,coalesce(sum(f.packets),0)::bigint packets,
                        coalesce(sum(f.flow_count),0)::bigint flows,max(f.last_seen) last_seen
                 FROM flow_conversations_5m f
@@ -1885,7 +1911,7 @@ def conversations(
                 LEFT JOIN interfaces ii ON ii.exporter=f.exporter AND ii.if_index=f.in_if
                 LEFT JOIN interfaces oi ON oi.exporter=f.exporter AND oi.if_index=f.out_if
                 WHERE {where}
-                GROUP BY f.exporter,f.in_if,f.out_if,ii.if_name,ii.if_descr,ii.if_alias,oi.if_name,oi.if_descr,oi.if_alias,e.hostname
+                GROUP BY f.exporter,f.in_if,f.out_if,ii.custom_name,ii.if_name,ii.if_descr,ii.if_alias,oi.custom_name,oi.if_name,oi.if_descr,oi.if_alias,e.custom_name,e.hostname
                 ORDER BY bytes DESC LIMIT %s OFFSET %s""",params)
             return cur.fetchall()
         cur.execute(
@@ -1984,7 +2010,7 @@ def statistics_flows(limit:int=10,offset:int=0,q:Optional[str]=None,date_from:Op
     sort_col=sort_map.get(sort or 'received_at','f.bucket_start'); sort_dir='ASC' if str(order).lower()=='asc' else 'DESC'
     params += [min(max(limit,1),100),max(offset,0)]
     with conn() as c,c.cursor() as cur:
-        cur.execute(f"""SELECT NULL::bigint id,f.bucket_start received_at,f.bucket_start first_seen,f.bucket_start+interval '5 minutes' last_seen,f.flows flow_count,host(f.exporter) exporter,e.hostname exporter_hostname,'statistics' flow_type,host(f.src_addr) src_addr,host(f.dst_addr) dst_addr,NULL::integer src_port,NULL::integer dst_port,f.proto,f.bytes,f.packets,NULLIF(f.in_if,0) in_if,NULLIF(f.out_if,0) out_if,NULLIF(f.service_port,0) service_port,NULLIF(f.service_side,'') service_side,CASE WHEN nullif(ii.if_alias,'') IS NOT NULL THEN coalesce(nullif(ii.if_name,''),nullif(ii.if_descr,''),'ifIndex '||NULLIF(f.in_if,0)::text)||' ('||ii.if_alias||')' ELSE COALESCE(NULLIF(ii.if_name,''),NULLIF(ii.if_descr,'')) END in_if_name,CASE WHEN nullif(oi.if_alias,'') IS NOT NULL THEN coalesce(nullif(oi.if_name,''),nullif(oi.if_descr,''),'ifIndex '||NULLIF(f.out_if,0)::text)||' ('||oi.if_alias||')' ELSE COALESCE(NULLIF(oi.if_name,''),NULLIF(oi.if_descr,'')) END out_if_name FROM flow_stats_conversations_5m f LEFT JOIN exporters e ON e.ip=f.exporter LEFT JOIN interfaces ii ON ii.exporter=f.exporter AND ii.if_index=NULLIF(f.in_if,0) LEFT JOIN interfaces oi ON oi.exporter=f.exporter AND oi.if_index=NULLIF(f.out_if,0) WHERE {where} ORDER BY {sort_col} {sort_dir},f.bytes DESC LIMIT %s OFFSET %s""",params)
+        cur.execute(f"""SELECT NULL::bigint id,f.bucket_start received_at,f.bucket_start first_seen,f.bucket_start+interval '5 minutes' last_seen,f.flows flow_count,host(f.exporter) exporter,coalesce(nullif(e.custom_name,''),nullif(e.hostname,'')) exporter_hostname,'statistics' flow_type,host(f.src_addr) src_addr,host(f.dst_addr) dst_addr,NULL::integer src_port,NULL::integer dst_port,f.proto,f.bytes,f.packets,NULLIF(f.in_if,0) in_if,NULLIF(f.out_if,0) out_if,NULLIF(f.service_port,0) service_port,NULLIF(f.service_side,'') service_side,CASE WHEN nullif(ii.if_alias,'') IS NOT NULL THEN coalesce(nullif(ii.custom_name,''),nullif(ii.if_name,''),nullif(ii.if_descr,''),'ifIndex '||NULLIF(f.in_if,0)::text)||' ('||ii.if_alias||')' ELSE COALESCE(NULLIF(ii.custom_name,''),NULLIF(ii.if_name,''),NULLIF(ii.if_descr,'')) END in_if_name,CASE WHEN nullif(oi.if_alias,'') IS NOT NULL THEN coalesce(nullif(oi.custom_name,''),nullif(oi.if_name,''),nullif(oi.if_descr,''),'ifIndex '||NULLIF(f.out_if,0)::text)||' ('||oi.if_alias||')' ELSE COALESCE(NULLIF(oi.custom_name,''),NULLIF(oi.if_name,''),NULLIF(oi.if_descr,'')) END out_if_name FROM flow_stats_conversations_5m f LEFT JOIN exporters e ON e.ip=f.exporter LEFT JOIN interfaces ii ON ii.exporter=f.exporter AND ii.if_index=NULLIF(f.in_if,0) LEFT JOIN interfaces oi ON oi.exporter=f.exporter AND oi.if_index=NULLIF(f.out_if,0) WHERE {where} ORDER BY {sort_col} {sort_dir},f.bytes DESC LIMIT %s OFFSET %s""",params)
         return cur.fetchall()
 
 @app.get('/api/statistics/flows/count')
@@ -2018,7 +2044,7 @@ def statistics_conversations(limit:int=10,offset:int=0,q:Optional[str]=None,date
     where,params=build_stats_filter(date_from,date_to,exporter,q,src,dst,src_port,dst_port,port,proto,in_if=in_if,out_if=out_if); params += [min(max(limit,1),100),max(offset,0)]
     with conn() as c,c.cursor() as cur:
         if group_by=='interface':
-            cur.execute(f"""SELECT host(f.exporter) exporter,NULLIF(f.in_if,0) in_if,NULLIF(f.out_if,0) out_if,CASE WHEN nullif(ii.if_alias,'') IS NOT NULL THEN coalesce(nullif(ii.if_name,''),nullif(ii.if_descr,''),'ifIndex '||NULLIF(f.in_if,0)::text)||' ('||ii.if_alias||')' ELSE coalesce(nullif(ii.if_name,''),nullif(ii.if_descr,''),'ifIndex '||NULLIF(f.in_if,0)::text) END in_if_name,CASE WHEN nullif(oi.if_alias,'') IS NOT NULL THEN coalesce(nullif(oi.if_name,''),nullif(oi.if_descr,''),'ifIndex '||NULLIF(f.out_if,0)::text)||' ('||oi.if_alias||')' ELSE coalesce(nullif(oi.if_name,''),nullif(oi.if_descr,''),'ifIndex '||NULLIF(f.out_if,0)::text) END out_if_name,coalesce(nullif(e.hostname,''),host(f.exporter)) device_name,sum(f.bytes)::bigint bytes,sum(f.packets)::bigint packets,sum(f.flows)::bigint flows,max(f.bucket_start+interval '5 minutes') last_seen FROM flow_stats_conversations_5m f LEFT JOIN exporters e ON e.ip=f.exporter LEFT JOIN interfaces ii ON ii.exporter=f.exporter AND ii.if_index=NULLIF(f.in_if,0) LEFT JOIN interfaces oi ON oi.exporter=f.exporter AND oi.if_index=NULLIF(f.out_if,0) WHERE {where} GROUP BY f.exporter,f.in_if,f.out_if,ii.if_name,ii.if_descr,ii.if_alias,oi.if_name,oi.if_descr,oi.if_alias,e.hostname ORDER BY bytes DESC LIMIT %s OFFSET %s""",params); return cur.fetchall()
+            cur.execute(f"""SELECT host(f.exporter) exporter,NULLIF(f.in_if,0) in_if,NULLIF(f.out_if,0) out_if,CASE WHEN nullif(ii.if_alias,'') IS NOT NULL THEN coalesce(nullif(ii.custom_name,''),nullif(ii.if_name,''),nullif(ii.if_descr,''),'ifIndex '||NULLIF(f.in_if,0)::text)||' ('||ii.if_alias||')' ELSE coalesce(nullif(ii.custom_name,''),nullif(ii.if_name,''),nullif(ii.if_descr,''),'ifIndex '||NULLIF(f.in_if,0)::text) END in_if_name,CASE WHEN nullif(oi.if_alias,'') IS NOT NULL THEN coalesce(nullif(oi.custom_name,''),nullif(oi.if_name,''),nullif(oi.if_descr,''),'ifIndex '||NULLIF(f.out_if,0)::text)||' ('||oi.if_alias||')' ELSE coalesce(nullif(oi.custom_name,''),nullif(oi.if_name,''),nullif(oi.if_descr,''),'ifIndex '||NULLIF(f.out_if,0)::text) END out_if_name,coalesce(nullif(e.custom_name,''),nullif(e.hostname,''),host(f.exporter)) device_name,sum(f.bytes)::bigint bytes,sum(f.packets)::bigint packets,sum(f.flows)::bigint flows,max(f.bucket_start+interval '5 minutes') last_seen FROM flow_stats_conversations_5m f LEFT JOIN exporters e ON e.ip=f.exporter LEFT JOIN interfaces ii ON ii.exporter=f.exporter AND ii.if_index=NULLIF(f.in_if,0) LEFT JOIN interfaces oi ON oi.exporter=f.exporter AND oi.if_index=NULLIF(f.out_if,0) WHERE {where} GROUP BY f.exporter,f.in_if,f.out_if,ii.custom_name,ii.if_name,ii.if_descr,ii.if_alias,oi.custom_name,oi.if_name,oi.if_descr,oi.if_alias,e.custom_name,e.hostname ORDER BY bytes DESC LIMIT %s OFFSET %s""",params); return cur.fetchall()
         cur.execute(f"SELECT host(f.src_addr) src_addr,host(f.dst_addr) dst_addr,sum(f.bytes)::bigint bytes,sum(f.packets)::bigint packets,sum(f.flows)::bigint flows,min(f.bucket_start) first_seen,max(f.bucket_start+interval '5 minutes') last_seen FROM flow_stats_conversations_5m f WHERE {where} GROUP BY f.src_addr,f.dst_addr ORDER BY bytes DESC,f.src_addr,f.dst_addr LIMIT %s OFFSET %s",params); return cur.fetchall()
 
 @app.get('/api/statistics/conversations/count')
@@ -2067,7 +2093,7 @@ def flows_series(
 def exporters():
     with conn() as c, c.cursor() as cur:
         cur.execute(
-            """SELECT host(e.ip) exporter,e.hostname,e.sys_descr,e.first_seen,e.last_seen,e.snmp_enabled,e.snmp_version,e.snmp_port,
+            """SELECT host(e.ip) exporter,e.hostname,e.custom_name,coalesce(nullif(e.custom_name,''),nullif(e.hostname,''),host(e.ip)) display_name,e.sys_descr,e.first_seen,e.last_seen,e.snmp_enabled,e.snmp_version,e.snmp_port,
                       e.snmp_last_poll,e.snmp_last_error,e.snmp_community,(e.snmp_community IS NOT NULL) community_set,
                       coalesce(fs.flows,0)::bigint flows,coalesce(fs.bytes,0)::bigint bytes,
                       coalesce(ic.interfaces,0)::bigint interfaces,
@@ -2078,6 +2104,18 @@ def exporters():
                ORDER BY e.ip ASC"""
         )
         return cur.fetchall()
+
+
+@app.put("/api/exporters/{exporter}/name")
+def update_exporter_name(exporter: str, payload: ExporterNameUpdate):
+    exporter = normalize_host(exporter)
+    name = (payload.name or "").strip() or None
+    with conn() as c, c.cursor() as cur:
+        cur.execute("UPDATE exporters SET custom_name=%s WHERE ip=%s::inet RETURNING host(ip) exporter,custom_name,hostname", (name, exporter))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Exporter not found")
+    return {"status":"ok", **row, "display_name": name or row.get("hostname") or exporter}
 
 
 @app.delete("/api/exporters/{exporter}")
@@ -2278,7 +2316,7 @@ def settings():
     raw=int(get_setting('raw_retention_hours',DEFAULT_RAW_RETENTION_HOURS))
     if raw not in (1,3,6,12,24): raw=min((1,3,6,12,24),key=lambda x:abs(x-raw))
     stats_days=max(1,int(get_setting('stats_retention_days',DEFAULT_STATS_RETENTION_DAYS)))
-    return {"raw_retention_total_hours":raw,"stats_retention_days":stats_days,**storage_breakdown()}
+    return {"raw_retention_total_hours":raw,"stats_retention_days":stats_days,"dns_resolution_enabled":get_setting('dns_resolution_enabled','false').lower()=='true',**storage_breakdown()}
 
 @app.put("/api/settings/retention")
 async def update_retention(request: Request):
@@ -2297,7 +2335,7 @@ def exporter_detail(exporter: str):
     exporter = normalize_host(exporter)
     with conn() as c, c.cursor() as cur:
         cur.execute(
-            """SELECT host(e.ip) exporter,e.hostname,e.sys_descr,e.first_seen,e.last_seen,e.snmp_enabled,e.snmp_version,e.snmp_port,
+            """SELECT host(e.ip) exporter,e.hostname,e.custom_name,coalesce(nullif(e.custom_name,''),nullif(e.hostname,''),host(e.ip)) display_name,e.sys_descr,e.first_seen,e.last_seen,e.snmp_enabled,e.snmp_version,e.snmp_port,
                       e.snmp_last_poll,e.snmp_last_error,e.snmp_community,(e.snmp_community IS NOT NULL) community_set,
                       (e.last_seen >= now() - interval '5 minutes') active
                FROM exporters e WHERE e.ip=%s::inet""",
@@ -2314,7 +2352,7 @@ def exporter_interfaces(exporter: str):
     exporter = normalize_host(exporter)
     with conn() as c, c.cursor() as cur:
         cur.execute(
-            """SELECT if_index,if_name,if_descr,if_alias,if_speed,admin_status,oper_status,updated_at
+            """SELECT if_index,if_name,if_descr,if_alias,custom_name,if_speed,admin_status,oper_status,updated_at
                FROM interfaces WHERE exporter=%s::inet ORDER BY if_index""",
             (exporter,),
         )
@@ -2341,7 +2379,7 @@ def interfaces_fixed(exporter: Optional[str] = None):
                        UNION
                        SELECT exporter,if_index FROM interfaces WHERE exporter=%s::inet
                    )
-                   SELECT host(a.exporter) exporter,e.hostname,a.if_index,i.if_name,i.if_descr,i.if_alias,i.if_speed,i.admin_status,i.oper_status,i.updated_at
+                   SELECT host(a.exporter) exporter,e.hostname,e.custom_name,coalesce(nullif(e.custom_name,''),nullif(e.hostname,''),host(a.exporter)) display_name,a.if_index,i.if_name,i.if_descr,i.if_alias,i.custom_name,i.if_speed,i.admin_status,i.oper_status,i.updated_at
                    FROM all_if a
                    LEFT JOIN interfaces i ON i.exporter=a.exporter AND i.if_index=a.if_index
                    LEFT JOIN exporters e ON e.ip=a.exporter
@@ -2359,14 +2397,82 @@ def interfaces_fixed(exporter: Optional[str] = None):
                        UNION
                        SELECT exporter,if_index FROM interfaces
                    )
-                   SELECT host(a.exporter) exporter,e.hostname,a.if_index,i.if_name,i.if_descr,i.if_alias,i.if_speed,i.admin_status,i.oper_status,i.updated_at
+                   SELECT host(a.exporter) exporter,e.hostname,e.custom_name,coalesce(nullif(e.custom_name,''),nullif(e.hostname,''),host(a.exporter)) display_name,a.if_index,i.if_name,i.if_descr,i.if_alias,i.custom_name,i.if_speed,i.admin_status,i.oper_status,i.updated_at
                    FROM all_if a
                    LEFT JOIN interfaces i ON i.exporter=a.exporter AND i.if_index=a.if_index
                    LEFT JOIN exporters e ON e.ip=a.exporter
-                   ORDER BY COALESCE(e.hostname,host(a.exporter)),a.if_index"""
+                   ORDER BY COALESCE(NULLIF(e.custom_name,''),NULLIF(e.hostname,''),host(a.exporter)),a.if_index"""
             )
         return cur.fetchall()
 
+
+@app.put("/api/exporters/{exporter}/interfaces/{if_index}/name")
+def update_interface_name(exporter: str, if_index: int, payload: InterfaceNameUpdate):
+    exporter=normalize_host(exporter); name=(payload.name or "").strip() or None
+    with conn() as c,c.cursor() as cur:
+        cur.execute("""INSERT INTO interfaces(exporter,if_index,custom_name) VALUES(%s::inet,%s,%s)
+                       ON CONFLICT(exporter,if_index) DO UPDATE SET custom_name=EXCLUDED.custom_name,updated_at=now()
+                       RETURNING if_index,custom_name""",(exporter,if_index,name))
+        row=cur.fetchone()
+    return {"status":"ok","exporter":exporter,**row}
+
+@app.get("/api/ip-names")
+def list_ip_names():
+    with conn() as c,c.cursor() as cur:
+        cur.execute("SELECT host(ip) ip,name,updated_at FROM ip_names ORDER BY ip")
+        return cur.fetchall()
+
+@app.post("/api/ip-names")
+def save_ip_name(payload: IpNameUpdate):
+    ip=normalize_host(payload.ip); name=payload.name.strip()
+    with conn() as c,c.cursor() as cur:
+        cur.execute("""INSERT INTO ip_names(ip,name) VALUES(%s::inet,%s)
+                       ON CONFLICT(ip) DO UPDATE SET name=EXCLUDED.name,updated_at=now()""",(ip,name))
+    return {"status":"ok","ip":ip,"name":name}
+
+@app.delete("/api/ip-names/{ip}")
+def delete_ip_name(ip: str):
+    ip=normalize_host(ip)
+    with conn() as c,c.cursor() as cur: cur.execute("DELETE FROM ip_names WHERE ip=%s::inet",(ip,))
+    return {"status":"ok"}
+
+@app.put("/api/settings/dns-resolution")
+async def set_dns_resolution(request: Request):
+    try: enabled=bool((await request.json()).get('enabled'))
+    except Exception: raise HTTPException(400,'Invalid JSON request body')
+    set_setting('dns_resolution_enabled','true' if enabled else 'false')
+    return {"status":"ok","dns_resolution_enabled":enabled}
+
+@app.get("/api/ip-labels")
+def ip_labels(ips: str = Query(default="", max_length=10000)):
+    requested=[]
+    for raw in ips.split(',')[:100]:
+        raw=raw.strip()
+        if not raw: continue
+        try: requested.append(str(ipaddress.ip_address(raw)))
+        except ValueError: pass
+    if not requested: return {}
+    enabled=get_setting('dns_resolution_enabled','false').lower()=='true'
+    out={}
+    with conn() as c,c.cursor() as cur:
+        cur.execute("SELECT host(ip) ip,name FROM ip_names WHERE ip = ANY(%s::inet[])",(requested,))
+        manual={r['ip']:r['name'] for r in cur.fetchall()}
+        for ip in requested:
+            if ip in manual: out[ip]={"name":manual[ip],"source":"manual"}; continue
+            if not enabled: continue
+            obj=ipaddress.ip_address(ip)
+            if not obj.is_global: continue
+            cur.execute("SELECT hostname,resolved_at FROM dns_cache WHERE ip=%s::inet",(ip,)); cached=cur.fetchone()
+            if cached and cached['resolved_at'] > datetime.now(timezone.utc)-timedelta(hours=24):
+                if cached['hostname']: out[ip]={"name":cached['hostname'],"source":"dns"}
+                continue
+            hostname=None
+            try: hostname=socket.gethostbyaddr(ip)[0].rstrip('.')
+            except Exception: pass
+            cur.execute("""INSERT INTO dns_cache(ip,hostname,resolved_at) VALUES(%s::inet,%s,now())
+                           ON CONFLICT(ip) DO UPDATE SET hostname=EXCLUDED.hostname,resolved_at=now()""",(ip,hostname))
+            if hostname: out[ip]={"name":hostname,"source":"dns"}
+    return out
 
 @app.get("/api/snmp/config")
 def snmp_config_get(exporter: str):
