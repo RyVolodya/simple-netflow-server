@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend / Python checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Check Python syntax without generating pycache
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          paths = sorted(Path('backend/app').rglob('*.py'))
+          assert paths, 'No Python files found'
+          for path in paths:
+              ast.parse(path.read_text(encoding='utf-8-sig'), filename=str(path))
+          print(f'Checked {len(paths)} Python files')
+          PY
+      - name: Install backend dependencies
+        run: python -m pip install -r backend/requirements.txt
+      - name: Verify dependency consistency
+        run: python -m pip check
+
+  frontend:
+    name: Frontend / HTML and JavaScript checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Extract and syntax-check inline JavaScript
+        run: |
+          python - <<'PY'
+          from html.parser import HTMLParser
+          from pathlib import Path
+
+          class Scripts(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.capture = False
+                  self.buffers = []
+              def handle_starttag(self, tag, attrs):
+                  if tag == 'script':
+                      a = dict(attrs)
+                      self.capture = 'src' not in a and a.get('type', 'text/javascript') in ('text/javascript', 'module', '')
+                      if self.capture:
+                          self.buffers.append([])
+              def handle_endtag(self, tag):
+                  if tag == 'script':
+                      self.capture = False
+              def handle_data(self, data):
+                  if self.capture:
+                      self.buffers[-1].append(data)
+
+          html = Path('frontend/index.html').read_text(encoding='utf-8')
+          parser = Scripts()
+          parser.feed(html)
+          scripts = [''.join(parts) for parts in parser.buffers if ''.join(parts).strip()]
+          assert scripts, 'No inline JavaScript found to check'
+          output = Path('/tmp/netflow-inline-scripts')
+          output.mkdir(exist_ok=True)
+          for i, script in enumerate(scripts, 1):
+              (output / f'script-{i}.mjs').write_text(script, encoding='utf-8')
+          print(f'Extracted {len(scripts)} JavaScript blocks')
+          PY
+          for file in /tmp/netflow-inline-scripts/*.mjs; do node --check "$file"; done
+
+  docker:
+    name: Docker / Compose and image checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Validate Docker Compose configuration
+        run: docker compose config --quiet
+      - name: Build backend image
+        run: docker build -t simple-netflow-backend:ci ./backend
+      - name: Pull service images
+        run: docker compose pull postgres collector spool-guard frontend
