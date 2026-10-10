@@ -468,7 +468,10 @@ When reporting an issue, include:
 
 ## License
 
-See the `LICENSE` file for license information.
+This project is licensed under the GPLv3 License.
+See the [LICENSE](LICENSE) file for details.
+
+Copyright © 2026 Volodymyr Rybak.
 
 ## Author
 
