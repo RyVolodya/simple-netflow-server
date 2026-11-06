@@ -67,7 +67,7 @@ services:
     networks: [simple-netflow]
 
   backend:
-    build: ./backend
+    image: ghcr.io/ryvolodya/simple-netflow-backend:${APP_IMAGE_TAG:-latest}
     restart: unless-stopped
     environment:
       DATABASE_URL: postgresql://netflow:netflow@postgres:5432/netflow
@@ -82,7 +82,7 @@ services:
       RETENTION_DAYS: 30
       RAW_RETENTION_HOURS: 24
       STATS_RETENTION_HOURS: 720
-      APP_VERSION: 0.8.22
+      APP_VERSION: 0.8.23
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-netflow}
       SESSION_HOURS: ${SESSION_HOURS:-24}
@@ -99,13 +99,10 @@ services:
     networks: [simple-netflow]
 
   frontend:
-    image: nginx:1.27-alpine
+    image: ghcr.io/ryvolodya/simple-netflow-frontend:${APP_IMAGE_TAG:-latest}
     restart: unless-stopped
     ports:
       - "${FRONTEND_PORT:-8080}:80"
-    volumes:
-      - ./frontend:/usr/share/nginx/html:ro
-      - ./frontend/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on: [backend]
     networks: [simple-netflow]
 

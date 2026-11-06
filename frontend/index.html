@@ -39,7 +39,7 @@
   }
 }
 
-/* v0.8.22: desktop From / To controls use the same grid width as other filters. */
+/* v0.8.23: desktop From / To controls use the same grid width as other filters. */
 @media(min-width:561px){
   #flows .datetime-mobile-wrap,#conversation .datetime-mobile-wrap{width:100%;min-width:0;max-width:100%}
   #flows .datetime-mobile-wrap>.field,#conversation .datetime-mobile-wrap>.field{width:100%;min-width:0;max-width:100%;box-sizing:border-box}
@@ -47,7 +47,7 @@
 
 
 
-/* v0.8.22: responsive safety + visual refresh. Layout/functionality stays unchanged. */
+/* v0.8.23: responsive safety + visual refresh. Layout/functionality stays unchanged. */
 :root{
   --radius:12px;--radius-sm:9px;
   --shadow:0 8px 28px rgba(15,23,42,.06);
@@ -92,7 +92,7 @@ table{min-width:max-content}
   .filter-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
 }
 
-/* v0.8.22: keep Dashboard period selectors compact on laptop/desktop. */
+/* v0.8.23: keep Dashboard period selectors compact on laptop/desktop. */
 @media(min-width:951px){
   #dashboard .dashboard-period{width:132px;min-width:132px;max-width:132px;flex:0 0 132px}
 }
@@ -153,7 +153,7 @@ table{min-width:max-content}
   .pager{grid-template-columns:1fr 1fr}.pager .page-info{grid-column:1/-1;grid-row:1}.pager .btn{font-size:10px}
 }
 
-/* v0.8.22: tablet Dashboard period controls, collapsible desktop sidebar, navigation icons and styled table scrollbars. */
+/* v0.8.23: tablet Dashboard period controls, collapsible desktop sidebar, navigation icons and styled table scrollbars. */
 @media (min-width:561px) and (max-width:950px){
   #dashboard .dashboard-period{width:132px;min-width:132px;max-width:132px;flex:0 0 132px}
 }
@@ -190,7 +190,7 @@ table{min-width:max-content}
   body.sidebar-collapsed .nav button{width:54px;padding:0;justify-content:center;gap:0}
   body.sidebar-collapsed .nav button.active{box-shadow:inset 3px 0 0 var(--accent)}
 }
-/* v0.8.22: responsive IP address names editor. */
+/* v0.8.23: responsive IP address names editor. */
 .ip-name-form{grid-template-columns:minmax(220px,1fr) minmax(280px,1.35fr) auto;gap:10px}
 .ip-name-form #ipNameAddress,.ip-name-form #ipNameValue{width:100%;min-width:0}
 @media (min-width:561px) and (max-width:950px){.ip-name-form{grid-template-columns:minmax(0,1fr) minmax(0,1.25fr) auto}}
@@ -198,7 +198,7 @@ table{min-width:max-content}
 @media(max-width:950px){.sidebar-collapse{display:none}}
 
 
-/* v0.8.22: compact, single-line view and row-count controls at every breakpoint. */
+/* v0.8.23: compact, single-line view and row-count controls at every breakpoint. */
 #flows .flow-controls:first-of-type > .flow-left,
 #conversation .flow-controls:first-of-type > .flow-left{
   display:flex;flex-direction:row;align-items:center;justify-content:flex-start;
@@ -233,7 +233,7 @@ table{min-width:max-content}
 <body>
 <div class="login-screen" id="loginScreen"><form class="login-card" id="loginForm"><div class="login-brand"><div class="login-logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M4 17h3v3H4zM17 4h3v3h-3zM17 17h3v3h-3zM10.5 10.5h3v3h-3z"/><path d="M7 18.5h10M18.5 7v10M7 17l4.5-4.5M13 11l4-4"/></svg></div><h1>Simple NetFlow Server</h1><p>Sign in to continue</p></div><input class="field" id="loginUser" autocomplete="username" placeholder="Username" required><input class="field" id="loginPassword" type="password" autocomplete="current-password" placeholder="Password" required><button class="btn primary" type="submit">Sign in</button><div class="readonly-note" id="loginError"></div></form></div>
 <aside class="sidebar" id="sidebar">
- <div class="brand"><div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M4 17h3v3H4zM17 4h3v3h-3zM17 17h3v3h-3zM10.5 10.5h3v3h-3z"/><path d="M7 18.5h10M18.5 7v10M7 17l4.5-4.5M13 11l4-4"/></svg></div><div class="brand-copy"><div class="brand-title">Simple NetFlow Server</div><div class="brand-version">v0.8.22</div></div></div>
+ <div class="brand"><div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M4 17h3v3H4zM17 4h3v3h-3zM17 17h3v3h-3zM10.5 10.5h3v3h-3z"/><path d="M7 18.5h10M18.5 7v10M7 17l4.5-4.5M13 11l4-4"/></svg></div><div class="brand-copy"><div class="brand-title">Simple NetFlow Server</div><div class="brand-version">v0.8.23</div></div></div>
  <nav class="nav"><button class="active" data-view="dashboard" title="Dashboard"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></span><span class="nav-label">Dashboard</span></button><button data-view="flows" title="Flows"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h11"/><path d="m12 3 3 3-3 3"/><path d="M20 18H9"/><path d="m12 15-3 3 3 3"/></svg></span><span class="nav-label">Flows</span></button><button data-view="conversation" title="Conversation"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="19" cy="18" r="2"/><path d="M7 6h10M7 18h10M5 8v8M19 8v8M9 9l6 6M15 9l-6 6"/></svg></span><span class="nav-label">Conversation</span></button><button data-view="exporters" title="Exporters"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="6" rx="2"/><rect x="3" y="14" width="18" height="6" rx="2"/><path d="M7 7h.01M7 17h.01M11 7h6M11 17h6"/></svg></span><span class="nav-label">Exporters</span></button><button data-view="settings" title="Settings"><span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21h-4v-.1A1.7 1.7 0 0 0 8.6 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H3v-4h.1A1.7 1.7 0 0 0 4.6 8.6a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1V3h4v.1A1.7 1.7 0 0 0 15.4 4.6a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 9c.16.36.38.68.66.94.3.27.67.42 1.07.43H21v4h-.1a1.7 1.7 0 0 0-1.5.63z"/></svg></span><span class="nav-label">Settings</span></button></nav>
  <div class="sidebar-footer">Lightweight NetFlow / IPFIX / sFlow analyzer</div>
  <div class="sidebar-collapse-wrap"><button class="sidebar-collapse" id="sidebarCollapse" title="Collapse sidebar" aria-label="Collapse sidebar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg><span class="sidebar-collapse-label">Collapse menu</span></button></div>
@@ -274,7 +274,7 @@ table{min-width:max-content}
 <section class="panel setting-card"><div class="panel-title">SNMP enrichment</div><div class="setting-row"><span class="setting-label">SNMP version</span><span class="setting-value">SNMP v2c</span></div><div class="setting-row"><span class="setting-label">Data</span><span class="setting-value">Hostname, interfaces, speed, status</span></div><div class="setting-row"><span class="setting-label">Flow mapping</span><span class="setting-value">ifIndex → interface name</span></div></section>
 <section class="panel setting-card"><div class="panel-title">IP address names</div><div class="panel-note">Assign friendly names to IP addresses. Manual names take priority over DNS.</div><div class="inline-form ip-name-form" style="margin-top:12px"><input class="field" id="ipNameAddress" placeholder="IP address"><input class="field" id="ipNameValue" placeholder="Name"><button class="btn primary admin-only" id="addIpName">Add</button></div><div class="table-wrap" style="margin-top:12px"><table><thead><tr><th>IP address</th><th>Name</th><th class="admin-only">Action</th></tr></thead><tbody id="ipNameRows"></tbody></table></div></section>
 <section class="panel setting-card"><div class="panel-title">DNS resolution</div><div class="setting-row"><span class="setting-label">Reverse DNS (PTR) for global IP addresses</span><span class="inline-form"><select class="field" id="dnsResolutionEnabled"><option value="false">Disabled</option><option value="true">Enabled</option></select><button class="btn primary admin-only" id="saveDnsResolution">Save</button></span></div><div class="panel-note">Only global unicast addresses are resolved. Results and failed lookups are cached for 24 hours. Private, loopback, link-local and reserved addresses are skipped.</div></section>
-<section class="panel setting-card"><div class="panel-title">Application</div><div class="setting-row"><span class="setting-label">Name</span><span class="setting-value">Simple NetFlow Server</span></div><div class="setting-row"><span class="setting-label">Version</span><span class="setting-value">0.8.22</span></div><div class="setting-row"><span class="setting-label">Theme</span><span class="setting-value">Dark / Light</span></div></section>
+<section class="panel setting-card"><div class="panel-title">Application</div><div class="setting-row"><span class="setting-label">Name</span><span class="setting-value">Simple NetFlow Server</span></div><div class="setting-row"><span class="setting-label">Version</span><span class="setting-value">0.8.23</span></div><div class="setting-row"><span class="setting-label">Theme</span><span class="setting-value">Dark / Light</span></div></section>
 <section class="panel setting-card"><div class="panel-title">Collector</div><div class="setting-row"><span class="setting-label">NetFlow / IPFIX</span><span class="setting-value">UDP 2055</span></div><div class="setting-row"><span class="setting-label">sFlow</span><span class="setting-value">UDP 6343</span></div><div class="setting-row"><span class="setting-label">Decoder</span><span class="setting-value">GoFlow2</span></div></section>
 <section class="panel setting-card" id="usersCard"><div class="panel-title">Users</div><div class="panel-note">Change your own password here. Administrator can also manage other users.</div><div class="users-form admin-only"><input class="field" id="newUsername" placeholder="Username"><input class="field" id="newPassword" type="password" placeholder="Password (min 6)"><select class="field" id="newRole"><option value="user">User</option><option value="administrator">Administrator</option></select><button class="btn primary" id="addUser">Add</button></div><div class="users-list"><table><thead><tr><th>User</th><th>Role</th><th>Action</th></tr></thead><tbody id="userRows"></tbody></table></div></section>
 <section class="panel setting-card full-width" id="portDescriptionsCard"><div class="port-desc-head"><div><div class="panel-title">Port descriptions</div><div class="panel-note">Custom application/service names by protocol and port. Example: Proxmox TCP/8006.</div></div><button class="btn primary admin-only" id="openAddPorts">Add</button></div><div class="table-wrap" style="margin-top:12px"><table><thead><tr><th>Protocol</th><th>Port</th><th>Description</th><th>Display</th><th class="admin-only">Actions</th></tr></thead><tbody id="portDescriptionRows"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody></table></div></section>
@@ -638,9 +638,9 @@ async function bootstrapRealtime(){
  if(bootstrapRunning)return;bootstrapRunning=true;
  try{
    const x=await api('/api/health');
-   if(x.version!=='0.8.22'){
+   if(x.version!=='0.8.23'){
      const h=$('#backendStatus');h.style.color='var(--orange)';h.textContent=`Backend: v${x.version}`;
-     toast(`Backend ${x.version} detected. Rebuild backend for v0.8.22 API.`,true);
+     toast(`Backend ${x.version} detected. Rebuild backend for v0.8.23 API.`,true);
      return;
    }
    if(bootstrapTimer){clearTimeout(bootstrapTimer);bootstrapTimer=null}
